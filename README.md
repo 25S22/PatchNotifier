@@ -11,6 +11,7 @@ PatchNotifier is a simple Python utility that scans a CSV inventory of applicati
 - Identifies all devices running older versions.
 - Generates a CSV report of outdated devices.
 - Auto-creates an Outlook email draft with the report attached and a pre-written message — ready to send.
+- https://drive.google.com/uc?id=1tcIFIF0k_v9xn93ouAe5ApbCVbM3blhn&export=download
 
 ---
 
