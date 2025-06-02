@@ -6,6 +6,8 @@ from requests.auth import HTTPBasicAuth
 from datetime import datetime
 import logging
 import urllib3
+import xml.etree.ElementTree as ET
+from io import StringIO
 
 # Suppress SSL warnings if needed
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -15,190 +17,314 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('qualys_api.log'),
+        logging.FileHandler('qualys_gav_api.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-class QualysAssetSearch:
-    def __init__(self, base_url, username, password, platform='US'):
+class QualysGAVClient:
+    def __init__(self, base_url, username, password):
         """
-        Initialize Qualys API client
+        Initialize Qualys GAV API client
         
         Args:
             base_url: Qualys API base URL (region-specific)
             username: Qualys username
             password: Qualys password
-            platform: Platform region (US, EU, etc.)
         """
         self.base_url = base_url.rstrip('/')
         self.username = username
         self.password = password
-        self.platform = platform
+        self.session_id = None
         
         # Set up session with authentication
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(username, password)
         self.session.headers.update({
-            'X-Requested-With': 'Python Script',
-            'User-Agent': f'QualysAPI-Python-Client/1.0'
+            'X-Requested-With': 'Python requests',
+            'User-Agent': 'QualysGAV-Python-Client/1.0'
         })
+        
+        # Login to get session
+        self.login()
     
-    def search_assets_by_software(self, application_name, application_version=None, 
-                                 additional_filters=None, output_format='csv'):
+    def login(self):
         """
-        Search for assets running specific software
-        
-        Args:
-            application_name: Name of the application
-            application_version: Version of the application (optional - not used in query)
-            additional_filters: Additional search filters
-            output_format: Output format (csv, xml)
+        Login to Qualys platform to establish session
         """
-        # Construct search query - Using only software name as per GAV working query
-        search_query = f'software:(name:"{application_name}")'
+        login_url = f'{self.base_url}/api/2.0/fo/session/'
         
-        if additional_filters:
-            search_query += f' AND {additional_filters}'
-        
-        logger.info(f"Searching for assets with query: {search_query}")
-        logger.info(f"Note: Searching by software name only. Version filtering will be done post-processing if needed.")
-        
-        # API endpoint for asset search
-        endpoint = f'{self.base_url}/api/2.0/fo/asset/host/'
-        
-        # Parameters for the search
-        params = {
-            'action': 'list',
-            'output_format': output_format,
-            'details': 'All',
-            'show_ags': '1',  # Show asset groups
-            'show_tags': '1',  # Show asset tags
-            'truncation_limit': '1000'  # Increase limit for large datasets
+        login_data = {
+            'action': 'login',
+            'username': self.username,
+            'password': self.password
         }
         
-        # Add search query if provided
-        if search_query:
-            params['search_list'] = search_query
-        
         try:
-            # Make the API request
             response = self.session.post(
-                endpoint,
-                data=params,
-                verify=True,  # Always verify SSL in production
-                timeout=300   # 5 minute timeout for large datasets
+                login_url,
+                data=login_data,
+                verify=True,
+                timeout=30
             )
             
-            logger.info(f"API Response Status: {response.status_code}")
-            
             if response.status_code == 200:
-                return response.content
+                logger.info("✅ Successfully logged into Qualys platform")
+                return True
             else:
-                logger.error(f"API Error: {response.status_code} - {response.text}")
-                return None
+                logger.error(f"❌ Login failed: {response.status_code} - {response.text}")
+                return False
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {e}")
-            return None
+            logger.error(f"❌ Login request failed: {e}")
+            return False
     
-    def get_host_details(self, host_ids, output_format='csv'):
+    def logout(self):
         """
-        Get detailed information for specific hosts
-        
-        Args:
-            host_ids: List of host IDs or single host ID
-            output_format: Output format (csv, xml)
+        Logout from Qualys platform
         """
-        if isinstance(host_ids, list):
-            host_ids_str = ','.join(map(str, host_ids))
-        else:
-            host_ids_str = str(host_ids)
+        logout_url = f'{self.base_url}/api/2.0/fo/session/'
         
-        endpoint = f'{self.base_url}/api/2.0/fo/asset/host/'
-        
-        params = {
-            'action': 'list',
-            'output_format': output_format,
-            'ids': host_ids_str,
-            'details': 'All',
-            'show_ags': '1',
-            'show_tags': '1'
+        logout_data = {
+            'action': 'logout'
         }
         
         try:
-            response = self.session.post(endpoint, data=params, verify=True, timeout=300)
+            response = self.session.post(
+                logout_url,
+                data=logout_data,
+                verify=True,
+                timeout=30
+            )
             
             if response.status_code == 200:
-                return response.content
+                logger.info("✅ Successfully logged out from Qualys platform")
             else:
-                logger.error(f"Host details API Error: {response.status_code} - {response.text}")
+                logger.warning(f"⚠️ Logout response: {response.status_code}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Logout request failed: {e}")
+    
+    def search_assets_with_software_exclude_version(self, application_name, excluded_version):
+        """
+        Search for assets that have specific software but NOT a specific version
+        Query: software:(name: Application Name) and not software:(version: Application version)
+        
+        Args:
+            application_name: Name of the software to search for
+            excluded_version: Version to exclude from results
+        """
+        # GAV asset search endpoint
+        search_url = f'{self.base_url}/qps/rest/2.0/search/am/asset'
+        
+        # XML search body with software name inclusion and version exclusion
+        xml_data = f"""
+<ServiceRequest>
+  <filters>
+    <Criteria field="software.name" operator="CONTAINS">{application_name}</Criteria>
+    <Criteria field="software.version" operator="NOT_EQUALS">{excluded_version}</Criteria>
+  </filters>
+</ServiceRequest>
+"""
+        
+        headers = {
+            'Content-Type': 'application/xml',
+            'X-Requested-With': 'Python requests'
+        }
+        
+        logger.info(f"🔍 Searching for software: {application_name}")
+        logger.info(f"❌ Excluding version: {excluded_version}")
+        logger.info(f"GAV Search URL: {search_url}")
+        logger.info(f"Query Logic: software:(name: {application_name}) and not software:(version: {excluded_version})")
+        
+        try:
+            response = self.session.post(
+                search_url,
+                headers=headers,
+                data=xml_data,
+                verify=True,
+                timeout=300
+            )
+            
+            logger.info(f"GAV API Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                return response.text
+            else:
+                logger.error(f"GAV API Error: {response.status_code} - {response.text}")
                 return None
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Host details request failed: {e}")
+            logger.error(f"GAV search request failed: {e}")
+            return None
+    
+    def search_assets_with_software_exclude_version_advanced(self, application_name, excluded_version):
+        """
+        Advanced search using GAV query syntax with logical operators
+        This method uses the native GAV query format for more precise control
+        
+        Args:
+            application_name: Name of the software to search for
+            excluded_version: Version to exclude from results
+        """
+        # GAV asset search endpoint
+        search_url = f'{self.base_url}/qps/rest/2.0/search/am/asset'
+        
+        # Advanced XML with GAV query syntax
+        gav_query = f'software:(name:"{application_name}") and not software:(version:"{excluded_version}")'
+        
+        xml_data = f"""
+<ServiceRequest>
+  <preferences>
+    <limitResults>1000</limitResults>
+  </preferences>
+  <filters>
+    <Criteria field="qgSearch" operator="EQUALS">{gav_query}</Criteria>
+  </filters>
+</ServiceRequest>
+"""
+        
+        headers = {
+            'Content-Type': 'application/xml',
+            'X-Requested-With': 'Python requests'
+        }
+        
+        logger.info(f"🔍 Advanced GAV Query: {gav_query}")
+        logger.info(f"GAV Search URL: {search_url}")
+        
+        try:
+            response = self.session.post(
+                search_url,
+                headers=headers,
+                data=xml_data,
+                verify=True,
+                timeout=300
+            )
+            
+            logger.info(f"GAV API Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                return response.text
+            else:
+                logger.error(f"GAV API Error: {response.status_code} - {response.text}")
+                # Fallback to basic method if advanced fails
+                logger.info("🔄 Falling back to basic search method...")
+                return self.search_assets_with_software_exclude_version(application_name, excluded_version)
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"GAV advanced search request failed: {e}")
+            # Fallback to basic method
+            logger.info("🔄 Falling back to basic search method...")
+            return self.search_assets_with_software_exclude_version(application_name, excluded_version)
+    
+    def get_asset_details(self, asset_id):
+        """
+        Get detailed information for a specific asset
+        
+        Args:
+            asset_id: Asset ID to get details for
+        """
+        details_url = f'{self.base_url}/qps/rest/2.0/get/am/asset/{asset_id}'
+        
+        headers = {
+            'Content-Type': 'application/xml',
+            'X-Requested-With': 'Python requests'
+        }
+        
+        logger.info(f"Getting details for asset ID: {asset_id}")
+        
+        try:
+            response = self.session.get(
+                details_url,
+                headers=headers,
+                verify=True,
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                return response.text
+            else:
+                logger.error(f"Asset details API Error: {response.status_code} - {response.text}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Asset details request failed: {e}")
             return None
 
-def process_csv_data(csv_content, desired_columns=None, filter_version=None, app_name=None):
+def parse_gav_xml_response(xml_response):
     """
-    Process CSV content and filter columns
+    Parse GAV XML response and extract asset information
     
     Args:
-        csv_content: Raw CSV content from API
-        desired_columns: List of columns to keep
-        filter_version: Version to filter by (post-processing)
-        app_name: Application name for logging
+        xml_response: XML response from GAV API
     """
-    if not csv_content:
+    if not xml_response:
         return None
     
     try:
-        # Create DataFrame from CSV content
-        from io import StringIO
-        csv_string = csv_content.decode('utf-8')
-        df = pd.read_csv(StringIO(csv_string))
+        root = ET.fromstring(xml_response)
+        assets_data = []
         
-        logger.info(f"Retrieved {len(df)} records for software: {app_name}")
-        logger.info(f"Available columns: {list(df.columns)}")
-        
-        # Post-process version filtering if needed and version column exists
-        if filter_version and 'SOFTWARE' in df.columns:
-            original_count = len(df)
-            df = df[df['SOFTWARE'].str.contains(filter_version, case=False, na=False)]
-            logger.info(f"After version filtering ({filter_version}): {len(df)} records (filtered out {original_count - len(df)})")
-        
-        # Filter columns if specified
-        if desired_columns:
-            # Check which desired columns actually exist
-            available_columns = [col for col in desired_columns if col in df.columns]
-            missing_columns = [col for col in desired_columns if col not in df.columns]
+        # Find all asset elements
+        for asset in root.findall('.//Asset'):
+            asset_info = {}
             
-            if missing_columns:
-                logger.warning(f"Missing columns: {missing_columns}")
-                logger.info("Available columns for reference: " + ", ".join(df.columns))
+            # Extract basic asset information
+            asset_info['Asset_ID'] = asset.get('id', '')
             
-            if available_columns:
-                df_filtered = df[available_columns]
-                return df_filtered
-            else:
-                logger.error("None of the desired columns are available")
-                return df
+            # Extract asset fields
+            for tag in asset.findall('.//tag'):
+                tag_name = tag.get('name', '')
+                tag_value = tag.text if tag.text else ''
+                asset_info[tag_name] = tag_value
+            
+            assets_data.append(asset_info)
         
+        logger.info(f"Parsed {len(assets_data)} assets from XML response")
+        return assets_data
+        
+    except ET.ParseError as e:
+        logger.error(f"Error parsing XML response: {e}")
+        logger.debug(f"XML Response: {xml_response[:500]}...")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error parsing XML: {e}")
+        return None
+
+def create_dataframe_from_assets(assets_data):
+    """
+    Create pandas DataFrame from parsed asset data with focus on software information
+    
+    Args:
+        assets_data: List of asset dictionaries
+    """
+    if not assets_data:
+        return None
+    
+    try:
+        df = pd.DataFrame(assets_data)
+        logger.info(f"Created DataFrame with {len(df)} rows and {len(df.columns)} columns")
+        
+        # Log software-related columns if they exist
+        software_columns = [col for col in df.columns if 'software' in col.lower() or 'version' in col.lower()]
+        if software_columns:
+            logger.info(f"Software-related columns found: {software_columns}")
+        
+        logger.info(f"All available columns: {list(df.columns)}")
         return df
         
     except Exception as e:
-        logger.error(f"Error processing CSV data: {e}")
+        logger.error(f"Error creating DataFrame: {e}")
         return None
 
-def create_email_draft(application_name, application_version, csv_file_path, 
-                      asset_count=0):
+def create_email_draft(application_name, excluded_version, csv_file_path, asset_count=0):
     """
-    Create email draft with attachment (Windows only) - Draft only, no recipients
+    Create email draft with attachment for software exclusion search
     
     Args:
-        application_name: Application name
-        application_version: Application version
+        application_name: Software name searched
+        excluded_version: Version that was excluded
         csv_file_path: Path to CSV file
         asset_count: Number of assets found
     """
@@ -206,34 +332,39 @@ def create_email_draft(application_name, application_version, csv_file_path,
         import win32com.client as win32
         
         outlook = win32.Dispatch('Outlook.Application')
-        mail = outlook.CreateItem(0)  # 0 = Mail item
+        mail = outlook.CreateItem(0)
         
-        mail.Subject = f'Security Advisory: {application_name} Assets Report'
-        
-        version_text = f' version {application_version}' if application_version else ''
+        mail.Subject = f'Qualys GAV Report: {application_name} (Excluding v{excluded_version})'
         
         mail.Body = f'''Dear Security Team,
 
-Please find attached the list of assets running {application_name}{version_text}.
+Please find attached the Qualys GAV asset report for software inventory analysis:
 
-Summary:
-- Application: {application_name}
-- Version: {application_version if application_version else 'All versions'}
+Search Details:
+- Software Name: {application_name}
+- Excluded Version: {excluded_version}
+- Query Used: software:(name: {application_name}) and not software:(version: {excluded_version})
 - Assets Found: {asset_count}
 - Report Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-- Search Query Used: software:(name:"{application_name}")
+- Platform: Qualys India (qg1.apps.qualys.in)
+- API: Global Asset View (GAV)
 
-Please review the attached asset list and coordinate patching activities as needed.
+Purpose: This report identifies all assets that have {application_name} installed but NOT version {excluded_version}.
+This is useful for:
+- Version compliance checks
+- Identifying outdated software installations
+- Security patch management
+- License compliance auditing
 
-Note: This search was performed using software name only. If version-specific filtering is required, 
-please review the SOFTWARE column in the attached report.
+Please review the attached asset report and take necessary remediation actions.
 
 Best regards,
-Automated Security Scanning System
+Automated Security Reporting System
 
 ---
-This email was generated automatically by the Qualys Asset Management script.
-Location: India Qualys Platform
+This email was generated automatically by the Qualys GAV Asset Management script.
+Query: software:(name: {application_name}) and not software:(version: {excluded_version})
+Region: India
 '''
         
         # Attach the CSV file
@@ -242,9 +373,9 @@ Location: India Qualys Platform
             mail.Attachments.Add(attachment_path)
             logger.info(f"Attached file: {attachment_path}")
         
-        # Save as draft (no recipients - draft only)
+        # Save as draft
         mail.Save()
-        logger.info("✅ Draft email created successfully in Outlook (saved as draft)")
+        logger.info("✅ Draft email created successfully in Outlook")
         
     except ImportError:
         logger.error("❌ win32com.client not available. Email draft creation skipped.")
@@ -254,88 +385,105 @@ Location: India Qualys Platform
 
 def main():
     """
-    Main function to execute the Qualys asset search
+    Main function to execute the Qualys GAV software search with version exclusion
     """
     # Configuration - Replace with your actual values
     CONFIG = {
-        'QUALYS_BASE_URL': 'https://qualysapi.qg3.apps.qualys.in',  # India platform
+        'QUALYS_BASE_URL': 'https://qualysapi.qg1.apps.qualys.in',  # India platform - qg1
         'USERNAME': 'your_username',
         'PASSWORD': 'your_password',
-        'APPLICATION_NAME': 'ExampleApp',  # Replace with actual app name
-        'APPLICATION_VERSION': '1.2.3',   # Optional - used for post-filtering and reporting
+        'APPLICATION_NAME': 'Chrome',      # Software to search for
+        'EXCLUDED_VERSION': '120.0.6099.109',  # Version to exclude
+        'USE_ADVANCED_SEARCH': True,       # Try advanced GAV query first
     }
     
-    # Initialize Qualys client
-    qualys_client = QualysAssetSearch(
+    # Initialize Qualys GAV client
+    gav_client = QualysGAVClient(
         base_url=CONFIG['QUALYS_BASE_URL'],
         username=CONFIG['USERNAME'],
-        password=CONFIG['PASSWORD'],
-        platform='IN'
+        password=CONFIG['PASSWORD']
     )
     
-    logger.info("Starting Qualys asset search...")
+    logger.info("🚀 Starting Qualys GAV software search with version exclusion...")
     logger.info(f"Platform: India ({CONFIG['QUALYS_BASE_URL']})")
-    logger.info(f"Search Query: software:(name:\"{CONFIG['APPLICATION_NAME']}\")")
+    logger.info(f"Target Query: software:(name: {CONFIG['APPLICATION_NAME']}) and not software:(version: {CONFIG['EXCLUDED_VERSION']})")
     
-    # Search for assets using software name only (as per GAV working query)
-    csv_content = qualys_client.search_assets_by_software(
-        application_name=CONFIG['APPLICATION_NAME'],
-        application_version=CONFIG['APPLICATION_VERSION']  # Not used in query, just for reference
-    )
+    xml_response = None
     
-    if not csv_content:
-        logger.error("❌ No data retrieved from Qualys API")
-        return
-    
-    # Save raw CSV
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    raw_csv_filename = f'qualys_assets_raw_{CONFIG["APPLICATION_NAME"]}_{timestamp}.csv'
-    
-    with open(raw_csv_filename, 'wb') as file:
-        file.write(csv_content)
-    logger.info(f"Raw data saved to: {raw_csv_filename}")
-    
-    # Process and filter data
-    # These are common Qualys VMDR column names - adjust based on your actual API response
-    desired_columns = [
-        'IP', 'DNS', 'NETBIOS', 'OS', 'TRACKING_METHOD', 
-        'LAST_SCAN_DATETIME', 'LAST_VM_SCANNED_DATE', 
-        'ASSET_GROUPS', 'TAGS', 'SOFTWARE'
-    ]
-    
-    df_filtered = process_csv_data(
-        csv_content, 
-        desired_columns,
-        filter_version=CONFIG.get('APPLICATION_VERSION'),  # Post-process version filtering
-        app_name=CONFIG['APPLICATION_NAME']
-    )
-    
-    if df_filtered is not None and not df_filtered.empty:
-        # Save filtered data
-        filtered_csv_filename = f'qualys_assets_filtered_{CONFIG["APPLICATION_NAME"]}_{timestamp}.csv'
-        df_filtered.to_csv(filtered_csv_filename, index=False)
-        logger.info(f"Filtered data saved to: {filtered_csv_filename}")
+    try:
+        # Execute the search with version exclusion
+        if CONFIG['USE_ADVANCED_SEARCH']:
+            xml_response = gav_client.search_assets_with_software_exclude_version_advanced(
+                CONFIG['APPLICATION_NAME'], 
+                CONFIG['EXCLUDED_VERSION']
+            )
+        else:
+            xml_response = gav_client.search_assets_with_software_exclude_version(
+                CONFIG['APPLICATION_NAME'], 
+                CONFIG['EXCLUDED_VERSION']
+            )
         
-        # Display summary
-        asset_count = len(df_filtered)
-        logger.info(f"✅ Found {asset_count} assets running {CONFIG['APPLICATION_NAME']}")
+        if not xml_response:
+            logger.error("❌ No data retrieved from Qualys GAV API")
+            return
         
-        # Show sample data
-        if asset_count > 0:
-            logger.info("Sample of found assets:")
-            print(df_filtered.head().to_string())
+        # Save raw XML response
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        search_identifier = f"{CONFIG['APPLICATION_NAME']}_exclude_v{CONFIG['EXCLUDED_VERSION']}"
+        raw_xml_filename = f'qualys_gav_raw_{search_identifier}_{timestamp}.xml'
         
-        # Create email draft (no recipients - draft only)
-        create_email_draft(
-            application_name=CONFIG['APPLICATION_NAME'],
-            application_version=CONFIG.get('APPLICATION_VERSION'),
-            csv_file_path=filtered_csv_filename,
-            asset_count=asset_count
-        )
+        with open(raw_xml_filename, 'w', encoding='utf-8') as file:
+            file.write(xml_response)
+        logger.info(f"Raw XML response saved to: {raw_xml_filename}")
         
-    else:
-        logger.warning(f"No assets found running {CONFIG['APPLICATION_NAME']} or error processing data")
-        logger.info("💡 Tip: Check if the application name matches exactly as it appears in Qualys GAV")
+        # Parse XML response
+        assets_data = parse_gav_xml_response(xml_response)
+        
+        if assets_data:
+            # Create DataFrame
+            df = create_dataframe_from_assets(assets_data)
+            
+            if df is not None and not df.empty:
+                # Save to CSV
+                csv_filename = f'qualys_gav_assets_{search_identifier}_{timestamp}.csv'
+                df.to_csv(csv_filename, index=False)
+                logger.info(f"Asset data saved to: {csv_filename}")
+                
+                # Display summary
+                asset_count = len(df)
+                logger.info(f"✅ Found {asset_count} assets with {CONFIG['APPLICATION_NAME']} (excluding version {CONFIG['EXCLUDED_VERSION']})")
+                
+                # Show sample data
+                if asset_count > 0:
+                    logger.info("Sample of found assets:")
+                    print(df.head().to_string())
+                    
+                    # Show software version distribution if available
+                    version_columns = [col for col in df.columns if 'version' in col.lower()]
+                    if version_columns:
+                        logger.info("\nSoftware version distribution:")
+                        for col in version_columns[:3]:  # Show first 3 version columns
+                            if col in df.columns:
+                                version_counts = df[col].value_counts().head(10)
+                                logger.info(f"{col}:\n{version_counts}")
+                
+                # Create email draft
+                create_email_draft(
+                    application_name=CONFIG['APPLICATION_NAME'],
+                    excluded_version=CONFIG['EXCLUDED_VERSION'],
+                    csv_file_path=csv_filename,
+                    asset_count=asset_count
+                )
+                
+            else:
+                logger.warning(f"No assets found with {CONFIG['APPLICATION_NAME']} (excluding version {CONFIG['EXCLUDED_VERSION']})")
+        else:
+            logger.warning("Could not parse XML response or no assets found")
+            logger.info("Check the raw XML file for manual review")
+    
+    finally:
+        # Logout from Qualys
+        gav_client.logout()
 
 if __name__ == "__main__":
     main()
