@@ -1,101 +1,118 @@
+#!/usr/bin/env python3
 import requests
 import pandas as pd
-import urllib.parse
 import sys
 import os
 
-# Configuration
-AUTH_BASE_URL = 'https://qualysapi.qg1.apps.qualys.in'  # Authentication URL for India
-GAV_BASE_URL = 'https://gateway.qg1.apps.qualys.in'     # GAV API base URL for India
+# ─────── CONFIGURATION ────────── #
+# 1) Use your India API server (as seen under Help → About in the UI)
+API_SERVER = 'https://qualysapi.qg1.apps.qualys.in'  
+USERNAME   = 'YOUR_QUALYS_USERNAME'    # fill in
+PASSWORD   = 'YOUR_QUALYS_PASSWORD'    # fill in
 
-USERNAME = 'YOUR_QUALYS_USERNAME'  # Replace with your Qualys username
-PASSWORD = 'YOUR_QUALYS_PASSWORD'  # Replace with your Qualys password
+# SSL_VERIFY can be True (use system CAs), False (no verification), or path to your cert bundle.
+SSL_VERIFY = True  
 
-SSL_VERIFY = True  # Set to False if you want to disable SSL verification (not recommended)
+# ─────── SCRIPT INPUT: Software Name & Version ────────── #
+# Provide these two values via command‐line args.
+if len(sys.argv) != 3:
+    print("Usage: python fetch_hosts_by_software.py <AppName> <AppVersion>")
+    sys.exit(1)
 
-# Application details
-APPLICATION_NAME = 'ExampleApp'    # Replace with your application name
-APPLICATION_VERSION = '1.2.3'      # Replace with your application version
+APP_NAME    = sys.argv[1]  # e.g. "ExampleApp"
+APP_VERSION = sys.argv[2]  # e.g. "1.2.3"
 
-def get_jwt_token(auth_url, username, password, verify_ssl):
+
+# ─────── STEP 1: LOGIN → OBTAIN QualysSession COOKIE ────────── #
+def get_session_cookie(api_server, user, pwd, verify_ssl):
     """
-    Authenticate with Qualys and retrieve JWT token.
+    POST to /api/2.0/fo/session/?action=login
+    Returns a dict like {'QualysSession': '<SESSION_ID>'} on success.
     """
-    url = f'{auth_url}/auth'
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    data = {
-        'username': username,
-        'password': password,
-        'token': 'true'
-    }
-
-    try:
-        response = requests.post(url, headers=headers, data=data, verify=verify_ssl)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f'Authentication failed: {e}')
-        sys.exit(1)
-
-    try:
-        token = response.json().get('token')
-        if not token:
-            print('JWT token not found in the response.')
-            sys.exit(1)
-        return token
-    except ValueError:
-        print('Invalid JSON response received during authentication.')
-        sys.exit(1)
-
-def fetch_filtered_assets(gav_url, jwt_token, app_name, app_version, verify_ssl):
-    """
-    Fetch assets filtered by application name and version.
-    """
-    filter_query = f'software:(name:"{app_name}" AND version:"{app_version}")'
-    encoded_filter = urllib.parse.quote(filter_query, safe='')
-    endpoint = f'{gav_url}/am/v1/assets/host/filter/list?filter={encoded_filter}&includeFields=assetId,assetHostName,operatingSystem,status'
-
+    login_url = f'{api_server}/api/2.0/fo/session/'
     headers = {
-        'Authorization': f'Bearer {jwt_token}',
-        'Accept': 'application/json'
+        'X-Requested-With': 'PythonScript'  
+    }
+    data = {
+        'action': 'login',
+        'username': user,
+        'password': pwd
     }
 
     try:
-        response = requests.post(endpoint, headers=headers, verify=verify_ssl)
-        response.raise_for_status()
+        resp = requests.post(login_url, headers=headers, data=data, verify=verify_ssl)
+        resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        print(f'Failed to fetch assets: {e}')
+        print(f'❌ Session login failed: {e}')
         sys.exit(1)
+
+    # Qualys returns Set-Cookie: QualysSession=<VALUE>; path=/api; secure
+    cookie_dict = resp.cookies.get_dict()
+    session_id = cookie_dict.get('QualysSession')
+    if not session_id:
+        print("❌ ERROR: 'QualysSession' cookie not found in login response.")
+        sys.exit(1)
+
+    print("✅ Logged in. Got QualysSession cookie.")
+    return {'QualysSession': session_id}
+
+
+# ─────── STEP 2: CALL ASSET API w/ softwareName & softwareVersion ────────── #
+def fetch_hosts_by_software(api_server, cookies, app_name, app_version, verify_ssl):
+    """
+    Calls /api/2.0/fo/asset/host/?action=list 
+    with softwareName & softwareVersion filters.
+    Returns the raw CSV text from Qualys (or raises on failure).
+    """
+    asset_url = f'{api_server}/api/2.0/fo/asset/host/'
+    params = {
+        'action': 'list',
+        # Output as CSV; you could also request JSON: 'output_format': 'JSON'
+        'output_format': 'CSV',
+        'details': 'All',
+        'softwareName': app_name,
+        'softwareVersion': app_version
+    }
+    headers = {
+        'X-Requested-With': 'PythonScript'
+    }
 
     try:
-        return response.json()
-    except ValueError:
-        print('Invalid JSON response received when fetching assets.')
+        resp = requests.post(asset_url, headers=headers, params=params, cookies=cookies, verify=verify_ssl)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f'❌ Asset list API failed: {e}')
+        if resp is not None:
+            print("Response text:", resp.text)
         sys.exit(1)
 
-def save_assets_to_csv(asset_data, filename='filtered_assets.csv'):
+    return resp.text  # raw CSV
+
+
+# ─────── STEP 3: SAVE CSV & (optional) LOAD INTO PANDAS ────────── #
+def save_and_show_csv(csv_text, filename='hosts_with_software.csv'):
     """
-    Save asset data to a CSV file.
+    Saves the CSV response to disk and also prints how many lines/rows it contains.
     """
-    assets = asset_data.get('assetListData', {}).get('asset', [])
-    if not assets:
-        print('No assets found matching the filter criteria.')
-        return
+    with open(filename, 'w', newline='') as f:
+        f.write(csv_text)
+    print(f"✅ Saved CSV to {os.path.abspath(filename)}")
 
-    df = pd.json_normalize(assets)
-    df.to_csv(filename, index=False)
-    print(f'Filtered assets saved to {os.path.abspath(filename)}')
+    # Quick check with pandas to count rows (excluding header)
+    try:
+        df = pd.read_csv(filename)
+        print(f"ℹ️  Retrieved {len(df)} host(s) matching the filter.")
+    except Exception as e:
+        print(f"⚠️ Could not parse CSV with pandas: {e}")
 
-def main():
-    # Step 1: Authenticate and get JWT token
-    jwt_token = get_jwt_token(AUTH_BASE_URL, USERNAME, PASSWORD, SSL_VERIFY)
-    print('Authentication successful.')
 
-    # Step 2: Fetch filtered assets
-    asset_data = fetch_filtered_assets(GAV_BASE_URL, jwt_token, APPLICATION_NAME, APPLICATION_VERSION, SSL_VERIFY)
-    print('Asset data fetched successfully.')
-
-    # Step 3: Save assets to CSV
-    save_assets_to_csv(asset_data)
-
+# ─────── MAIN ────────── #
 if __name__ == '__main__':
-    main()
+    # 1. Get session cookie
+    cookies = get_session_cookie(API_SERVER, USERNAME, PASSWORD, SSL_VERIFY)
+
+    # 2. Fetch only hosts that have APP_NAME @ APP_VERSION
+    csv_data = fetch_hosts_by_software(API_SERVER, cookies, APP_NAME, APP_VERSION, SSL_VERIFY)
+
+    # 3. Save and show results
+    save_and_show_csv(csv_data)
