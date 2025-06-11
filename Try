@@ -2,125 +2,303 @@ import requests
 import xml.etree.ElementTree as ET
 from requests.auth import HTTPBasicAuth
 import csv
+import sys
 
-class QualysSoftwareSearch:
-    def __init__(self, username, password, cert_path):
-        self.base_url = "https://qg1.qualysapi.in"
+class QualysHostAssetSearcher:
+    """
+    Search for Host Assets in Qualys that have a given installed software,
+    using the Qualys Asset Management & Tagging API (QPS REST 2.0),
+    aligned with the Qualys API User Guide (v3.19.1, Jan 22, 2025).
+    """
+
+    def __init__(self, username: str, password: str, cert_path: str, page_size: int = 100):
+        """
+        :param username: Qualys username
+        :param password: Qualys password
+        :param cert_path: Path to corporate CA bundle or cert for SSL verification
+        :param page_size: Number of records per page for search (default 100)
+        """
+        # Base URL for QG1 (India)
+        self.base_url = "https://qualysapi.qg1.apps.qualys.in"
         self.session = requests.Session()
+        # Basic Auth for QPS REST calls
         self.auth = HTTPBasicAuth(username, password)
         self.cert_path = cert_path
-        self.headers = {
+        self.page_size = page_size
+
+        # Headers for FO session login/logout
+        self.fo_headers = {"X-Requested-With": "Python script"}
+        # Headers for QPS REST calls
+        self.qps_headers = {
             "Content-Type": "application/xml",
             "Accept": "application/xml"
         }
 
     def login(self):
+        """
+        FO session login to Qualys: POST to /api/2.0/fo/session/ with data action=login.
+        Stores QualysSession cookie in self.session.
+        """
         url = f"{self.base_url}/api/2.0/fo/session/"
         data = {
             "action": "login",
             "username": self.auth.username,
             "password": self.auth.password
         }
-        resp = self.session.post(url, data=data, verify=self.cert_path)
-        resp.raise_for_status()
-        print("✅ Login successful!")
+        resp = self.session.post(url, headers=self.fo_headers, data=data, verify=self.cert_path)
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            raise Exception(f"Login HTTP error: {e}\nResponse body:\n{resp.text}")
+        # Confirm QualysSession cookie present
+        if "QualysSession" not in self.session.cookies:
+            # Debug print cookies
+            print(f"[DEBUG] session.cookies after login: {self.session.cookies.get_dict()}")
+            raise Exception("Login failed: QualysSession cookie not set. Check credentials or SSL cert.")
+        print("[✓] FO session login successful.")
 
     def logout(self):
+        """
+        FO session logout: POST to /api/2.0/fo/session/ with data action=logout.
+        """
         url = f"{self.base_url}/api/2.0/fo/session/"
         data = {"action": "logout"}
-        resp = self.session.post(url, data=data, verify=self.cert_path)
-        resp.raise_for_status()
-        print("✅ Logged out!")
+        try:
+            resp = self.session.post(url, headers=self.fo_headers, data=data, verify=self.cert_path)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[!] Logout HTTP error (ignored): {e}")
+        else:
+            print("[✓] FO session logout successful.")
 
-    def build_search_body(self, software_name):
+    def build_search_body(self, software_name: str, start_offset: int) -> bytes:
+        """
+        Build XML body for search Host Assets request, using installedSoftware filter and pagination.
+        Uses <preferences><startFromOffset> and <limitResults> as per API guide.
+        """
         root = ET.Element("ServiceRequest")
         filters = ET.SubElement(root, "filters")
-        criteria = ET.SubElement(filters, "Criteria", {
-            "field": "software",
-            "operator": "EQUALS"
-        })
+        # Filter on installedSoftware; using CONTAINS for substring match
+        criteria = ET.SubElement(filters, "Criteria", field="installedSoftware", operator="CONTAINS")
         criteria.text = software_name
-        return ET.tostring(root, encoding="utf-8", method="xml")
 
-    def search_host_assets(self, software_name):
+        prefs = ET.SubElement(root, "preferences")
+        # startFromOffset: first item index to return
+        ET.SubElement(prefs, "startFromOffset").text = str(start_offset)
+        # limitResults: number of items per page
+        ET.SubElement(prefs, "limitResults").text = str(self.page_size)
+
+        # Optionally, we could add <fields> to limit returned fields, e.g.,
+        # <fields>
+        #   <HostAsset>
+        #     <id/>
+        #     <dnsHostName/>
+        #     <netbiosName/>
+        #   </HostAsset>
+        # </fields>
+        # But we retrieve full HostAsset elements, then parse needed fields.
+
+        xml_data = ET.tostring(root, encoding="utf-8", method="xml")
+        return xml_data
+
+    def search_host_assets(self, software_name: str):
+        """
+        Search Host Assets matching installedSoftware CONTAINS software_name.
+        Paginates via startFromOffset until no more records.
+
+        Returns a list of HostAsset XML elements.
+        """
         search_url = f"{self.base_url}/qps/rest/2.0/search/am/hostasset"
-        all_assets = []
+        all_host_elements = []
+        offset = 1
         page = 1
 
+        print(f"[*] Searching Host Assets for installedSoftware containing: '{software_name}'")
         while True:
-            print(f"🔍 Fetching page {page}...")
-            body = self.build_search_body(software_name)
+            print(f"  → Fetching page {page} (startFromOffset={offset}) ...")
+            body = self.build_search_body(software_name, offset)
             resp = self.session.post(
                 search_url,
-                headers=self.headers,
+                headers=self.qps_headers,
                 auth=self.auth,
                 data=body,
                 verify=self.cert_path
             )
-            resp.raise_for_status()
+            # Check auth
+            if resp.status_code == 403:
+                raise Exception(f"Search Host Assets returned 403 Forbidden. Check Basic Auth or session. Response:\n{resp.text}")
+            try:
+                resp.raise_for_status()
+            except Exception as e:
+                raise Exception(f"Search Host Assets HTTP error: {e}\nResponse body:\n{resp.text}")
 
-            root = ET.fromstring(resp.content)
-            has_more = root.findtext('.//hasMoreRecords') == "true"
-            assets = root.findall('.//HostAsset')
-            print(f"✅ Found {len(assets)} assets on page {page}")
-            all_assets.extend(assets)
+            # Parse XML
+            try:
+                root = ET.fromstring(resp.content)
+            except ET.ParseError as e:
+                raise Exception(f"Failed to parse search response XML: {e}\nContent:\n{resp.text}")
 
+            # Check responseCode
+            resp_code = root.findtext("responseCode")
+            if resp_code != "SUCCESS":
+                # Could check for error message in <error> elements
+                raise Exception(f"Search Host Assets returned responseCode={resp_code}. Full response:\n{resp.text}")
+
+            # Extract HostAsset elements under <data>
+            host_elements = root.findall(".//HostAsset")
+            count_this_page = len(host_elements)
+            print(f"    • Retrieved {count_this_page} HostAsset entries on page {page}.")
+            if count_this_page == 0:
+                break
+
+            all_host_elements.extend(host_elements)
+
+            # Pagination: check hasMoreRecords
+            has_more = root.findtext(".//hasMoreRecords") == "true"
             if not has_more:
                 break
+            # Next offset: increment by page_size
+            offset += self.page_size
             page += 1
 
-        return all_assets
+        total = len(all_host_elements)
+        print(f"[✓] Search completed. Total HostAssets found: {total}")
+        return all_host_elements
 
-    def extract_software_info(self, host_assets):
+    def get_software_for_host(self, host_element: ET.Element, software_name: str):
+        """
+        Given a HostAsset XML element (from search response), extract:
+         - id, dnsHostName, netbiosName
+         - Find installed software entries matching software_name (exact or substring)
+         - Return dict or list of dicts with keys: id, dns, netbios, software, version.
+        Note: The search response may not include detailed software version; if not present,
+        we perform a GET hostasset/<id> call to retrieve full software list.
+        """
+        # First, try to see if the search response included software info:
+        # Often, search response does NOT include full HostAssetSoftwareList; so we must call GET.
+        host_id = host_element.findtext("id")
+        dns = host_element.findtext("dnsHostName", default="N/A")
+        netbios = host_element.findtext("netbiosName", default="N/A")
+
+        # Call GET HostAsset info to retrieve installed software list
+        get_url = f"{self.base_url}/qps/rest/2.0/get/am/hostasset/{host_id}"
+        req = ET.Element("ServiceRequest")
+        ET.SubElement(req, "id").text = host_id
+        xml_data = ET.tostring(req, encoding="utf-8", method="xml")
+
+        resp = self.session.post(
+            get_url,
+            headers=self.qps_headers,
+            auth=self.auth,
+            data=xml_data,
+            verify=self.cert_path
+        )
+        if resp.status_code == 403:
+            raise Exception(f"Get HostAsset {host_id} returned 403 Forbidden. Check Basic Auth or session.")
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            raise Exception(f"Get HostAsset HTTP error for ID={host_id}: {e}\nResponse:\n{resp.text}")
+
+        # Parse GET response XML
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError as e:
+            raise Exception(f"Failed to parse get-hostasset XML for ID={host_id}: {e}\nContent:\n{resp.text}")
+
+        # Ensure responseCode is SUCCESS
+        resp_code = root.findtext("responseCode")
+        if resp_code != "SUCCESS":
+            raise Exception(f"Get HostAsset returned responseCode={resp_code} for ID={host_id}. Response:\n{resp.text}")
+
+        host_info = root.find(".//HostAsset")
+        if host_info is None:
+            return None
+
+        # Iterate installed software entries under HostAssetSoftwareList or similar
         results = []
-        for asset in host_assets:
-            hostname = asset.findtext(".//hostName")
-            asset_id = asset.findtext(".//id")
-            softwares = asset.findall(".//Software")
-            for sw in softwares:
-                name = sw.findtext("name")
-                version = sw.findtext("version")
+        # According to XSD, installed software entries are under <HostAssetSoftwareList><HostAssetSoftware>
+        for sw in host_info.findall(".//HostAssetSoftware"):
+            name = (sw.findtext("name") or "").strip()
+            version = (sw.findtext("version") or "").strip()
+            # Match exact name or substring?
+            # Here, since search used CONTAINS, we match case-insensitive substring:
+            if software_name.lower() in name.lower():
                 results.append({
-                    "Host Name": hostname,
-                    "Asset ID": asset_id,
-                    "Software": name,
-                    "Version": version
+                    "id": host_id,
+                    "dns": dns,
+                    "netbios": netbios,
+                    "software": name,
+                    "version": version
                 })
+        # If no matching entries found, return None
+        if not results:
+            return None
         return results
 
-    def save_to_csv(self, data, filename="output.csv"):
-        if not data:
-            print("⚠️ No data to write.")
-            return
-        with open(filename, mode='w', newline='') as file:
-            writer = csv.DictWriter(file, fieldnames=data[0].keys())
-            writer.writeheader()
-            writer.writerows(data)
-        print(f"📁 Data written to {filename}")
-
-    def run(self, software_name):
+    def run(self, software_name: str):
+        """
+        Main flow: login, search host assets for software_name, get software details, write CSV, logout.
+        """
+        # 1. Login
         self.login()
+
         try:
-            assets = self.search_host_assets(software_name)
-            data = self.extract_software_info(assets)
-            self.save_to_csv(data)
+            # 2. Search Host Assets
+            host_elements = self.search_host_assets(software_name)
+            if not host_elements:
+                print(f"No Host Assets found with installedSoftware containing '{software_name}'.")
+                return
+
+            # 3. For each host, retrieve software details
+            all_records = []
+            total = len(host_elements)
+            print(f"[*] Retrieving software details for {total} hosts...")
+            for idx, host_elem in enumerate(host_elements, start=1):
+                host_id = host_elem.findtext("id")
+                try:
+                    recs = self.get_software_for_host(host_elem, software_name)
+                    if recs:
+                        for rec in recs:
+                            all_records.append(rec)
+                        print(f"[{idx}/{total}] ✓ HostID={host_id}: found {len(recs)} matching software entries")
+                    else:
+                        # Unlikely: search said present, but GET shows none matching; log warning
+                        print(f"[{idx}/{total}] ⚠️ HostID={host_id}: no matching software entries in GET response")
+                except Exception as e:
+                    print(f"[{idx}/{total}] ⚠️ Error for HostID={host_id}: {e}")
+
+            # 4. Write CSV
+            if all_records:
+                out_filename = f"hosts_with_{software_name.replace(' ', '_')}.csv"
+                with open(out_filename, mode="w", newline="", encoding="utf-8") as f:
+                    fieldnames = ["id", "dns", "netbios", "software", "version"]
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for row in all_records:
+                        writer.writerow(row)
+                print(f"[✓] CSV saved: {out_filename}  (total entries: {len(all_records)})")
+            else:
+                print("No matching software entries found in any HostAsset details.")
         finally:
+            # 5. Logout
             self.logout()
 
-# ------------------ MAIN FUNCTION ------------------
 
 def main():
-    # Replace these with your actual credentials and cert
+    # === CONFIGURE WITH YOUR CREDENTIALS & CERTIFICATE ===
     USERNAME = "your_qualys_username"
     PASSWORD = "your_qualys_password"
-    CERT_PATH = "/path/to/your/certificate.pem"
+    CERT_PATH = "/path/to/your/corporate_cert.pem"  # Ensure this PEM includes necessary CAs
 
-    SOFTWARE_NAME = input("🔍 Enter the software name to search: ").strip()
+    software_name = input("Enter the software name to search (substring match): ").strip()
+    if not software_name:
+        print("Software name cannot be empty. Exiting.")
+        sys.exit(1)
 
-    scanner = QualysSoftwareSearch(USERNAME, PASSWORD, CERT_PATH)
-    scanner.run(SOFTWARE_NAME)
+    searcher = QualysHostAssetSearcher(USERNAME, PASSWORD, CERT_PATH, page_size=100)
+    searcher.run(software_name)
 
-# ------------------ ENTRY POINT ------------------
 
 if __name__ == "__main__":
     main()
