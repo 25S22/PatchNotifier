@@ -53,7 +53,7 @@ class QualysSoftwareSearch:
             resp = self.session.post(
                 search_url,
                 headers=self.headers,
-                auth=self.auth,  # ← required for search
+                auth=self.auth,
                 data=body,
                 verify=self.cert_path
             )
@@ -100,7 +100,27 @@ class QualysSoftwareSearch:
 
     def run(self, software_name):
         self.login()
-        assets = self.search_host_assets(software_name)
-        data = self.extract_software_info(assets)
-        self.save_to_csv(data)
-        self.logout()
+        try:
+            assets = self.search_host_assets(software_name)
+            data = self.extract_software_info(assets)
+            self.save_to_csv(data)
+        finally:
+            self.logout()
+
+# ------------------ MAIN FUNCTION ------------------
+
+def main():
+    # Replace these with your actual credentials and cert
+    USERNAME = "your_qualys_username"
+    PASSWORD = "your_qualys_password"
+    CERT_PATH = "/path/to/your/certificate.pem"
+
+    SOFTWARE_NAME = input("🔍 Enter the software name to search: ").strip()
+
+    scanner = QualysSoftwareSearch(USERNAME, PASSWORD, CERT_PATH)
+    scanner.run(SOFTWARE_NAME)
+
+# ------------------ ENTRY POINT ------------------
+
+if __name__ == "__main__":
+    main()
