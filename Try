@@ -1,219 +1,106 @@
 import requests
 import xml.etree.ElementTree as ET
+from requests.auth import HTTPBasicAuth
 import csv
-import sys
 
-# === CONFIGURATION ===
-BASE_URL = "https://qualysapi.qg1.apps.qualys.com"   # Adjust for your region/platform if needed
-USERNAME = "your_qualys_username"                    # <-- replace
-PASSWORD = "your_qualys_password"                    # <-- replace
-SSL_CERT_PATH = "/path/to/your/corporate_cert.pem"   # <-- replace with your PEM bundle
-PAGE_SIZE = 100
-# Use CONTAINS to match substrings; if you know exact name and indexing works, you could try EQUALS.
-FILTER_OPERATOR = "CONTAINS"  # or "EQUALS"
-
-def login(session):
-    """
-    Perform FO session login; store QualysSession cookie in session.
-    """
-    login_url = f"{BASE_URL}/api/2.0/fo/session/"
-    data = {
-        "action": "login",
-        "username": USERNAME,
-        "password": PASSWORD
-    }
-    headers = {"X-Requested-With": "PythonScript"}
-    resp = session.post(login_url, data=data, headers=headers, verify=SSL_CERT_PATH)
-    try:
-        resp.raise_for_status()
-    except Exception as e:
-        raise Exception(f"Login HTTP error: {e}\nResponse body: {resp.text}")
-    # Verify cookie
-    if "QualysSession" not in session.cookies:
-        # Sometimes Qualys returns Set-Cookie under a different domain? Print cookies for debug
-        print(f"[!] After login, session.cookies: {session.cookies.get_dict()}")
-        raise Exception("Login failed: QualysSession cookie not set. Check credentials or SSL_CERT_PATH.")
-    print("[✓] Logged in to Qualys FO session; QualysSession cookie present.")
-
-def logout(session):
-    """
-    Logout FO session.
-    """
-    logout_url = f"{BASE_URL}/api/2.0/fo/session/"
-    data = {"action": "logout"}
-    headers = {"X-Requested-With": "PythonScript"}
-    try:
-        resp = session.post(logout_url, data=data, headers=headers, verify=SSL_CERT_PATH)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[!] Warning: Logout HTTP error: {e}")
-    else:
-        print("[✓] Logged out from Qualys FO session.")
-
-def search_host_assets(session, software_name):
-    """
-    Search Host Assets with installedSoftware CONTAINS software_name.
-    Returns list of host IDs.
-    """
-    all_ids = []
-    last_record_id = None
-
-    print(f"[*] Searching Host Assets where installedSoftware {FILTER_OPERATOR} '{software_name}'")
-
-    page = 1
-    while True:
-        # Build ServiceRequest XML
-        root = ET.Element("ServiceRequest")
-        filters = ET.SubElement(root, "filters")
-        criteria = ET.SubElement(filters, "Criteria", field="installedSoftware", operator=FILTER_OPERATOR)
-        criteria.text = software_name
-
-        prefs = ET.SubElement(root, "preferences")
-        ET.SubElement(prefs, "pageSize").text = str(PAGE_SIZE)
-        if last_record_id:
-            ET.SubElement(prefs, "lastRecordId").text = last_record_id
-
-        xml_data = ET.tostring(root, encoding="utf-8")
-        # Debug: show XML if needed
-        # print(f"[DEBUG] Search Request XML (page {page}):\n{xml_data.decode('utf-8')}")
-
-        headers = {
-            "X-Requested-With": "PythonScript",
+class QualysSoftwareSearch:
+    def __init__(self, username, password, cert_path):
+        self.base_url = "https://qg1.qualysapi.in"
+        self.session = requests.Session()
+        self.auth = HTTPBasicAuth(username, password)
+        self.cert_path = cert_path
+        self.headers = {
             "Content-Type": "application/xml",
             "Accept": "application/xml"
         }
-        search_url = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
-        resp = session.post(search_url, data=xml_data, headers=headers, verify=SSL_CERT_PATH)
 
-        # Check authentication / forbidden
-        if resp.status_code == 403:
-            raise Exception(f"Search Host Assets returned 403 Forbidden. Session may not be authenticated. Response body:\n{resp.text}")
-        try:
-            resp.raise_for_status()
-        except Exception as e:
-            raise Exception(f"Search Host Assets HTTP error: {e}\nResponse body: {resp.text}")
-
-        # Parse XML
-        try:
-            root_resp = ET.fromstring(resp.content)
-        except ET.ParseError as e:
-            raise Exception(f"Failed to parse search response XML on page {page}: {e}\nResponse content:\n{resp.text}")
-
-        # Extract host IDs
-        ids = [elem.text for elem in root_resp.findall(".//HostAsset/id") if elem.text]
-        if not ids:
-            print(f"[→] Page {page}: no HostAsset IDs found.")
-            break
-
-        all_ids.extend(ids)
-        print(f"[→] Page {page}: Retrieved {len(ids)} HostAsset IDs; running total: {len(all_ids)}")
-
-        # Check pagination
-        has_more = root_resp.findtext(".//hasMoreRecords") == "true"
-        if has_more:
-            last_record_id = ids[-1]
-            page += 1
-        else:
-            break
-
-    print(f"[✓] Completed search. Total HostAsset IDs found: {len(all_ids)}")
-    return all_ids
-
-def get_software_data_for_host(session, host_id, software_name):
-    """
-    Fetch HostAsset details, return dict with software entry if found; else None.
-    """
-    get_url = f"{BASE_URL}/qps/rest/2.0/get/am/hostasset/{host_id}"
-    headers = {
-        "X-Requested-With": "PythonScript",
-        "Content-Type": "application/xml",
-        "Accept": "application/xml"
-    }
-    root = ET.Element("ServiceRequest")
-    ET.SubElement(root, "id").text = host_id
-    xml_data = ET.tostring(root, encoding="utf-8")
-
-    resp = session.post(get_url, data=xml_data, headers=headers, verify=SSL_CERT_PATH)
-    if resp.status_code == 403:
-        raise Exception(f"Get HostAsset {host_id} returned 403 Forbidden. Session may have expired.")
-    try:
+    def login(self):
+        url = f"{self.base_url}/api/2.0/fo/session/"
+        data = {
+            "action": "login",
+            "username": self.auth.username,
+            "password": self.auth.password
+        }
+        resp = self.session.post(url, data=data, verify=self.cert_path)
         resp.raise_for_status()
-    except Exception as e:
-        raise Exception(f"Get HostAsset HTTP error for ID={host_id}: {e}\nResponse body:\n{resp.text}")
+        print("✅ Login successful!")
 
-    try:
-        root_resp = ET.fromstring(resp.content)
-    except ET.ParseError as e:
-        raise Exception(f"Failed to parse get-hostasset XML for ID={host_id}: {e}\nResponse content:\n{resp.text}")
+    def logout(self):
+        url = f"{self.base_url}/api/2.0/fo/session/"
+        data = {"action": "logout"}
+        resp = self.session.post(url, data=data, verify=self.cert_path)
+        resp.raise_for_status()
+        print("✅ Logged out!")
 
-    host_elem = root_resp.find(".//HostAsset")
-    if host_elem is None:
-        return None
+    def build_search_body(self, software_name):
+        root = ET.Element("ServiceRequest")
+        filters = ET.SubElement(root, "filters")
+        criteria = ET.SubElement(filters, "Criteria", {
+            "field": "software",
+            "operator": "EQUALS"
+        })
+        criteria.text = software_name
+        return ET.tostring(root, encoding="utf-8", method="xml")
 
-    dns = host_elem.findtext("dnsHostName", default="N/A")
-    netbios = host_elem.findtext("netbiosName", default="N/A")
+    def search_host_assets(self, software_name):
+        search_url = f"{self.base_url}/qps/rest/2.0/search/am/hostasset"
+        all_assets = []
+        page = 1
 
-    for sw in host_elem.findall(".//HostAssetSoftware"):
-        name = (sw.findtext("name") or "").strip()
-        version = (sw.findtext("version") or "").strip()
-        if name.lower() == software_name.lower():
-            return {
-                "id": host_id,
-                "dns": dns,
-                "netbios": netbios,
-                "software": name,
-                "version": version
-            }
-    return None
+        while True:
+            print(f"🔍 Fetching page {page}...")
+            body = self.build_search_body(software_name)
+            resp = self.session.post(
+                search_url,
+                headers=self.headers,
+                auth=self.auth,  # ← required for search
+                data=body,
+                verify=self.cert_path
+            )
+            resp.raise_for_status()
 
-def main():
-    software_name = input("Enter software name to search for (substring match): ").strip()
-    if not software_name:
-        print("Software name cannot be empty. Exiting.")
-        sys.exit(1)
+            root = ET.fromstring(resp.content)
+            has_more = root.findtext('.//hasMoreRecords') == "true"
+            assets = root.findall('.//HostAsset')
+            print(f"✅ Found {len(assets)} assets on page {page}")
+            all_assets.extend(assets)
 
-    session = requests.Session()
-    try:
-        # 1. Login
-        login(session)
+            if not has_more:
+                break
+            page += 1
 
-        # 2. Search HostAsset IDs
-        host_ids = search_host_assets(session, software_name)
-        if not host_ids:
-            print("No hosts found with that software filter. You may try a different filter/operator.")
-            return
+        return all_assets
 
-        # 3. Fetch details for each host
+    def extract_software_info(self, host_assets):
         results = []
-        total = len(host_ids)
-        print(f"[*] Retrieving details for {total} hosts...")
-        for idx, hid in enumerate(host_ids, start=1):
-            try:
-                rec = get_software_data_for_host(session, hid, software_name)
-                if rec:
-                    results.append(rec)
-                    print(f"[{idx}/{total}] ✓ HostID={hid}, DNS='{rec['dns']}', Version='{rec['version']}'")
-                else:
-                    print(f"[{idx}/{total}] ✗ HostID={hid}: software entry not found in details (unexpected)")
-            except Exception as e:
-                print(f"[{idx}/{total}] ⚠️ Error processing HostID={hid}: {e}")
+        for asset in host_assets:
+            hostname = asset.findtext(".//hostName")
+            asset_id = asset.findtext(".//id")
+            softwares = asset.findall(".//Software")
+            for sw in softwares:
+                name = sw.findtext("name")
+                version = sw.findtext("version")
+                results.append({
+                    "Host Name": hostname,
+                    "Asset ID": asset_id,
+                    "Software": name,
+                    "Version": version
+                })
+        return results
 
-        # 4. Write results to CSV
-        out_filename = f"hosts_with_{software_name.replace(' ', '_')}.csv"
-        with open(out_filename, mode="w", newline="", encoding="utf-8") as csvfile:
-            fieldnames = ["id", "dns", "netbios", "software", "version"]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    def save_to_csv(self, data, filename="output.csv"):
+        if not data:
+            print("⚠️ No data to write.")
+            return
+        with open(filename, mode='w', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=data[0].keys())
             writer.writeheader()
-            for row in results:
-                writer.writerow(row)
-        print(f"[✓] CSV saved: {out_filename}  (Total hosts with software: {len(results)})")
+            writer.writerows(data)
+        print(f"📁 Data written to {filename}")
 
-    finally:
-        # Logout in any case
-        try:
-            logout(session)
-        except Exception as e:
-            print(f"[!] Logout exception: {e}")
-
-if __name__ == "__main__":
-    main()
+    def run(self, software_name):
+        self.login()
+        assets = self.search_host_assets(software_name)
+        data = self.extract_software_info(assets)
+        self.save_to_csv(data)
+        self.logout()
