@@ -1,0 +1,31 @@
+def extract_matching_software(self, host_elem: ET.Element, software_name: str):
+    host_id = host_elem.findtext("id", default="")
+    dns = host_elem.findtext("dnsHostName", default="")
+    netbios = host_elem.findtext("netbiosName", default="")
+    records = []
+    found = False
+
+    for sw in host_elem.findall(".//HostAssetSoftware"):
+        name = (sw.findtext("name") or "").strip()
+        version = (sw.findtext("version") or "").strip()
+
+        if software_name.lower() in name.lower():
+            found = True
+            records.append({
+                "id": host_id,
+                "dnsHostName": dns,
+                "netbiosName": netbios,
+                "software": name,  # log actual matched name
+                "version": version if version else "UNKNOWN"
+            })
+
+    # If software matched by host-level but not in HostAssetSoftware list, log it for visibility
+    if not found:
+        records.append({
+            "id": host_id,
+            "dnsHostName": dns,
+            "netbiosName": netbios,
+            "software": "MATCHED HOST BUT NOT FOUND IN SOFTWARE LIST",
+            "version": "UNKNOWN"
+        })
+    return records
