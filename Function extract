@@ -1,31 +1,194 @@
-def extract_matching_software(self, host_elem: ET.Element, software_name: str):
-    host_id = host_elem.findtext("id", default="")
-    dns = host_elem.findtext("dnsHostName", default="")
-    netbios = host_elem.findtext("netbiosName", default="")
-    records = []
-    found = False
+import requests
+import xml.etree.ElementTree as ET
+from requests.auth import HTTPBasicAuth
+import pandas as pd
+import sys
+import logging
 
-    for sw in host_elem.findall(".//HostAssetSoftware"):
-        name = (sw.findtext("name") or "").strip()
-        version = (sw.findtext("version") or "").strip()
+# === CONFIGURATION ===
+USERNAME = "your_qualys_username"             # <-- replace
+PASSWORD = "your_qualys_password"             # <-- replace
+CERT_PATH = "/path/to/your/corporate_cert.pem"   # <-- replace
+BASE_URL = "https://qualysapi.qg1.apps.qualys.in"
+PAGE_SIZE = 100       # adjust if needed
+FILTER_OPERATOR = "CONTAINS"
+LOG_LEVEL = logging.INFO
 
-        if software_name.lower() in name.lower():
-            found = True
+# === LOGGER SETUP ===
+logger = logging.getLogger("QualysHostAssetSoftwareSearch")
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter("[%(levelname)s] %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(LOG_LEVEL)
+
+class QualysHostAssetSearcher:
+    def __init__(self, username, password, cert_path, page_size=100):
+        self.base_url = BASE_URL.rstrip("/")
+        self.session = requests.Session()
+        self.auth = HTTPBasicAuth(username, password)
+        self.cert_path = cert_path
+        self.page_size = page_size
+        self.fo_headers = {"X-Requested-With": "Python script"}
+        self.qps_headers = {
+            "Content-Type": "application/xml",
+            "Accept": "application/xml"
+        }
+
+    def login(self):
+        login_url = f"{self.base_url}/api/2.0/fo/session/"
+        data = {
+            "action": "login",
+            "username": self.auth.username,
+            "password": self.auth.password
+        }
+        logger.info("Logging into Qualys FO session...")
+        resp = self.session.post(login_url, headers=self.fo_headers, data=data, verify=self.cert_path)
+        resp.raise_for_status()
+        if "QualysSession" not in self.session.cookies:
+            raise Exception("Login failed: QualysSession cookie missing.")
+        logger.info("Login successful.")
+
+    def logout(self):
+        logout_url = f"{self.base_url}/api/2.0/fo/session/"
+        data = {"action": "logout"}
+        try:
+            self.session.post(logout_url, headers=self.fo_headers, data=data, verify=self.cert_path)
+            logger.info("Logged out from Qualys.")
+        except Exception as e:
+            logger.warning(f"Logout failed (ignored): {e}")
+
+    def build_search_body(self, software_name, start_offset):
+        root = ET.Element("ServiceRequest")
+        filters = ET.SubElement(root, "filters")
+        criteria = ET.SubElement(filters, "Criteria", field="installedSoftware", operator=FILTER_OPERATOR)
+        criteria.text = software_name
+
+        prefs = ET.SubElement(root, "preferences")
+        ET.SubElement(prefs, "startFromOffset").text = str(start_offset)
+        ET.SubElement(prefs, "limitResults").text = str(self.page_size)
+
+        fields = ET.SubElement(root, "fields")
+        ha = ET.SubElement(fields, "HostAsset")
+        ET.SubElement(ha, "id")
+        ET.SubElement(ha, "dnsHostName")
+        ET.SubElement(ha, "netbiosName")
+        hasl = ET.SubElement(ha, "HostAssetSoftwareList")
+        has = ET.SubElement(hasl, "HostAssetSoftware")
+        ET.SubElement(has, "name")
+        ET.SubElement(has, "version")
+
+        return ET.tostring(root, encoding="utf-8", method="xml")
+
+    def search_hosts(self, software_name):
+        endpoint = f"{self.base_url}/qps/rest/2.0/search/am/hostasset"
+        offset = 1
+        host_elements = []
+        page = 1
+
+        while True:
+            logger.info(f"Querying page {page}, offset={offset}")
+            xml_body = self.build_search_body(software_name, offset)
+            resp = self.session.post(
+                endpoint,
+                headers=self.qps_headers,
+                auth=self.auth,
+                data=xml_body,
+                verify=self.cert_path
+            )
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+
+            response_code = root.findtext("responseCode")
+            if response_code != "SUCCESS":
+                raise Exception(f"Qualys responseCode={response_code}")
+
+            hosts = root.findall(".//HostAsset")
+            if not hosts:
+                break
+            host_elements.extend(hosts)
+
+            has_more = root.findtext(".//hasMoreRecords") == "true"
+            if not has_more:
+                break
+            offset += self.page_size
+            page += 1
+
+        logger.info(f"Total hosts returned: {len(host_elements)}")
+        return host_elements
+
+    def extract_matching_software(self, host_elem, software_name):
+        host_id = host_elem.findtext("id", default="")
+        dns = host_elem.findtext("dnsHostName", default="")
+        netbios = host_elem.findtext("netbiosName", default="")
+        records = []
+        found = False
+
+        for sw in host_elem.findall(".//HostAssetSoftware"):
+            name = (sw.findtext("name") or "").strip()
+            version = (sw.findtext("version") or "").strip()
+
+            if software_name.lower() in name.lower():
+                found = True
+                records.append({
+                    "id": host_id,
+                    "dnsHostName": dns,
+                    "netbiosName": netbios,
+                    "software": name,
+                    "version": version if version else "UNKNOWN"
+                })
+
+        if not found:
             records.append({
                 "id": host_id,
                 "dnsHostName": dns,
                 "netbiosName": netbios,
-                "software": name,  # log actual matched name
-                "version": version if version else "UNKNOWN"
+                "software": f"NOT FOUND (searched '{software_name}')",
+                "version": "UNKNOWN"
             })
 
-    # If software matched by host-level but not in HostAssetSoftware list, log it for visibility
-    if not found:
-        records.append({
-            "id": host_id,
-            "dnsHostName": dns,
-            "netbiosName": netbios,
-            "software": "MATCHED HOST BUT NOT FOUND IN SOFTWARE LIST",
-            "version": "UNKNOWN"
-        })
-    return records
+        return records
+
+    def run(self, software_name):
+        try:
+            self.login()
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+            return
+
+        try:
+            all_results = []
+            hosts = self.search_hosts(software_name)
+            total = len(hosts)
+
+            for i, host in enumerate(hosts, start=1):
+                try:
+                    matches = self.extract_matching_software(host, software_name)
+                    all_results.extend(matches)
+                    logger.info(f"[{i}/{total}] Processed HostID={host.findtext('id')}")
+                except Exception as e:
+                    logger.error(f"Error processing host {i}: {e}")
+
+        finally:
+            self.logout()
+
+        if all_results:
+            df = pd.DataFrame(all_results)
+            safe_name = software_name.replace(" ", "_")
+            filename = f"{safe_name}_host_versions_full.xlsx"
+            df.to_excel(filename, index=False)
+            logger.info(f"Excel written: {filename} with {len(df)} rows")
+        else:
+            logger.warning("No data to write to Excel.")
+
+def main():
+    software_name = input("Enter the software name to search (substring match): ").strip()
+    if not software_name:
+        logger.error("Software name is required.")
+        sys.exit(1)
+
+    searcher = QualysHostAssetSearcher(USERNAME, PASSWORD, CERT_PATH, PAGE_SIZE)
+    searcher.run(software_name)
+
+if __name__ == "__main__":
+    main()
