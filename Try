@@ -1,0 +1,135 @@
+import requests
+import xml.etree.ElementTree as ET
+import csv
+
+# === CONFIG ===
+BASE_URL = "https://qualysapi.qg1.apps.qualys.com"
+USERNAME = "your_qualys_username"
+PASSWORD = "your_qualys_password"
+SSL_CERT_PATH = "/path/to/your/corporate_cert.pem"
+PAGE_SIZE = 100
+
+def login(session):
+    url = f"{BASE_URL}/api/2.0/fo/session/"
+    data = {"action": "login", "username": USERNAME, "password": PASSWORD}
+    headers = {"X-Requested-With": "PythonScript"}
+    r = session.post(url, data=data, headers=headers, verify=SSL_CERT_PATH)
+    if "QualysSession" not in session.cookies:
+        raise Exception("❌ Login failed.")
+    print("[✓] Logged in.")
+
+def logout(session):
+    url = f"{BASE_URL}/api/2.0/fo/session/"
+    session.post(url, data={"action": "logout"}, headers={"X-Requested-With": "PythonScript"}, verify=SSL_CERT_PATH)
+    print("[✓] Logged out.")
+
+def search_host_assets(session, software_name):
+    all_ids = []
+    last_record_id = None
+
+    while True:
+        body = ET.Element("ServiceRequest")
+        filters = ET.SubElement(body, "filters")
+        criteria = ET.SubElement(filters, "Criteria", field="installedSoftware", operator="EQUALS")
+        criteria.text = software_name
+
+        prefs = ET.SubElement(body, "preferences")
+        ET.SubElement(prefs, "pageSize").text = str(PAGE_SIZE)
+        if last_record_id:
+            ET.SubElement(prefs, "lastRecordId").text = last_record_id
+
+        xml_data = ET.tostring(body, encoding="utf-8")
+        headers = {
+            "X-Requested-With": "PythonScript",
+            "Content-Type": "application/xml",
+            "Accept": "application/xml"
+        }
+
+        url = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
+        r = session.post(url, data=xml_data, headers=headers, verify=SSL_CERT_PATH)
+        r.raise_for_status()
+
+        root = ET.fromstring(r.content)
+        ids = [e.text for e in root.findall(".//HostAsset/id")]
+        if not ids:
+            break
+
+        all_ids.extend(ids)
+        print(f"[→] Retrieved {len(ids)} IDs. Total: {len(all_ids)}")
+
+        if root.findtext(".//hasMoreRecords") == "true":
+            last_record_id = ids[-1]
+        else:
+            break
+
+    return all_ids
+
+def get_software_data(session, host_id, software_name):
+    url = f"{BASE_URL}/qps/rest/2.0/get/am/hostasset/{host_id}"
+    headers = {
+        "X-Requested-With": "PythonScript",
+        "Content-Type": "application/xml",
+        "Accept": "application/xml"
+    }
+
+    req_xml = ET.Element("ServiceRequest")
+    ET.SubElement(req_xml, "id").text = host_id
+    r = session.post(url, data=ET.tostring(req_xml), headers=headers, verify=SSL_CERT_PATH)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.content)
+    host = root.find(".//HostAsset")
+    if host is None:
+        return None
+
+    dns = host.findtext("dnsHostName", default="N/A")
+    netbios = host.findtext("netbiosName", default="N/A")
+
+    for sw in host.findall(".//HostAssetSoftware"):
+        name = sw.findtext("name", "").strip()
+        version = sw.findtext("version", "UNKNOWN").strip()
+        if name.lower() == software_name.lower():
+            return {
+                "id": host_id,
+                "dns": dns,
+                "netbios": netbios,
+                "software": name,
+                "version": version
+            }
+
+    return None
+
+def main():
+    software_name = input("Enter software to search: ").strip()
+    session = requests.Session()
+    try:
+        login(session)
+        host_ids = search_host_assets(session, software_name)
+
+        print(f"[✓] Found {len(host_ids)} devices. Checking software presence...")
+
+        results = []
+        for i, host_id in enumerate(host_ids, 1):
+            try:
+                record = get_software_data(session, host_id, software_name)
+                if record:
+                    results.append(record)
+                    print(f"[{i}/{len(host_ids)}] ✓ {record['dns']} | v{record['version']}")
+                else:
+                    print(f"[{i}/{len(host_ids)}] ✗ Software not found in host details")
+            except Exception as e:
+                print(f"[{i}/{len(host_ids)}] ⚠️ Error for Host ID {host_id}: {e}")
+
+        out_file = f"software_devices_{software_name.replace(' ', '_')}.csv"
+        with open(out_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["id", "dns", "netbios", "software", "version"])
+            writer.writeheader()
+            writer.writerows(results)
+
+        print(f"[✓] CSV saved: {out_file}")
+
+    finally:
+        logout(session)
+
+if __name__ == "__main__":
+    main()
