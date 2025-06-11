@@ -1,21 +1,21 @@
 import requests
 import xml.etree.ElementTree as ET
 from requests.auth import HTTPBasicAuth
-import csv
+import pandas as pd
 import sys
 import logging
 
 # === CONFIGURATION ===
-USERNAME = "your_qualys_username"            # <-- replace
-PASSWORD = "your_qualys_password"            # <-- replace
-CERT_PATH = "/path/to/your/corporate_cert.pem"  # <-- replace: PEM bundle for SSL verification
+USERNAME = "your_qualys_username"             # <-- replace
+PASSWORD = "your_qualys_password"             # <-- replace
+CERT_PATH = "/path/to/your/corporate_cert.pem"   # <-- replace
 BASE_URL = "https://qualysapi.qg1.apps.qualys.in"
-PAGE_SIZE = 100      # adjust up to allowed max (e.g., 100 or 1000 if supported)
-FILTER_OPERATOR = "CONTAINS"  # or "EQUALS" if you know the exact indexed software name
+PAGE_SIZE = 100       # adjust up to allowed max
+FILTER_OPERATOR = "CONTAINS"  # used to find hosts; for exact matching nested entries we filter later
 LOG_LEVEL = logging.INFO
 
 # === LOGGER SETUP ===
-logger = logging.getLogger("QualysHostAssetSearch")
+logger = logging.getLogger("QualysHostAssetExactSearch")
 handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter("[%(levelname)s] %(message)s")
 handler.setFormatter(formatter)
@@ -23,17 +23,16 @@ logger.addHandler(handler)
 logger.setLevel(LOG_LEVEL)
 
 
-class QualysHostAssetSearcher:
+class QualysHostAssetExactSearcher:
     """
-    Searches Qualys Host Assets with installed software, returning only:
-    HostAsset.id, HostAsset.dnsHostName, HostAsset.netbiosName,
-    and nested HostAssetSoftwareList -> HostAssetSoftware name/version.
+    Searches Qualys Host Assets for installedSoftware containing a term (to find hosts),
+    but in output only logs exact matches of software name and version for that software.
+    Writes results to Excel.
     """
 
     def __init__(self, username: str, password: str, cert_path: str, page_size: int = 100):
         self.base_url = BASE_URL.rstrip("/")
         self.session = requests.Session()
-        # Basic Auth for QPS calls
         self.auth = HTTPBasicAuth(username, password)
         self.cert_path = cert_path
         self.page_size = page_size
@@ -48,7 +47,7 @@ class QualysHostAssetSearcher:
 
     def login(self):
         """
-        FO session login to Qualys: POST /api/2.0/fo/session/ with action=login.
+        FO session login.
         """
         login_url = f"{self.base_url}/api/2.0/fo/session/"
         data = {
@@ -62,13 +61,13 @@ class QualysHostAssetSearcher:
             resp.raise_for_status()
         except Exception as e:
             logger.error(f"Login HTTP error: {e}")
-            logger.debug(f"Response status: {resp.status_code}, body:\n{resp.text}")
+            logger.debug(f"Response: {resp.status_code}, body:\n{resp.text}")
             raise
 
         if "QualysSession" not in self.session.cookies:
-            logger.error("Login succeeded HTTP-wise but QualysSession cookie not found.")
-            logger.debug(f"Cookies after login: {self.session.cookies.get_dict()}")
-            raise Exception("Login failed: QualysSession cookie missing. Check credentials or SSL cert.")
+            logger.error("Login succeeded HTTP-wise but QualysSession cookie missing.")
+            logger.debug(f"Cookies: {self.session.cookies.get_dict()}")
+            raise Exception("Login failed: missing QualysSession cookie.")
         logger.info("Login successful.")
 
     def logout(self):
@@ -87,32 +86,11 @@ class QualysHostAssetSearcher:
 
     def build_search_body(self, software_name: str, start_offset: int) -> bytes:
         """
-        Build XML for search HostAsset with installedSoftware filter and fields:
-        <ServiceRequest>
-          <filters>
-            <Criteria field="installedSoftware" operator="{FILTER_OPERATOR}">software_name</Criteria>
-          </filters>
-          <preferences>
-            <startFromOffset>start_offset</startFromOffset>
-            <limitResults>page_size</limitResults>
-          </preferences>
-          <fields>
-            <HostAsset>
-              <id/>
-              <dnsHostName/>
-              <netbiosName/>
-              <HostAssetSoftwareList>
-                <HostAssetSoftware>
-                  <name/>
-                  <version/>
-                </HostAssetSoftware>
-              </HostAssetSoftwareList>
-            </HostAsset>
-          </fields>
-        </ServiceRequest>
+        Build XML for search HostAsset with installedSoftware filter (substring),
+        and only select fields we need: id, dnsHostName, netbiosName, nested software list.
         """
         root = ET.Element("ServiceRequest")
-        # Filters
+        # Filters: find hosts that have this software somewhere, using CONTAINS or EQUALS
         filters = ET.SubElement(root, "filters")
         criteria = ET.SubElement(filters, "Criteria", field="installedSoftware", operator=FILTER_OPERATOR)
         criteria.text = software_name
@@ -122,13 +100,12 @@ class QualysHostAssetSearcher:
         ET.SubElement(prefs, "startFromOffset").text = str(start_offset)
         ET.SubElement(prefs, "limitResults").text = str(self.page_size)
 
-        # Fields selection
+        # Fields: HostAsset fields + HostAssetSoftwareList nested
         fields = ET.SubElement(root, "fields")
         ha = ET.SubElement(fields, "HostAsset")
         ET.SubElement(ha, "id")
         ET.SubElement(ha, "dnsHostName")
         ET.SubElement(ha, "netbiosName")
-        # Nested software list
         hasl = ET.SubElement(ha, "HostAssetSoftwareList")
         has = ET.SubElement(hasl, "HostAssetSoftware")
         ET.SubElement(has, "name")
@@ -139,17 +116,16 @@ class QualysHostAssetSearcher:
             logger.debug(f"Search request XML (offset={start_offset}):\n{xml_bytes.decode('utf-8')}")
         return xml_bytes
 
-    def search(self, software_name: str):
+    def search_hosts(self, software_name: str):
         """
-        Search HostAsset entries for installedSoftware matching software_name substring.
-        Returns list of dicts: id, dnsHostName, netbiosName, software, version.
+        Search HostAsset entries for installedSoftware substring match.
+        Returns list of HostAsset XML elements.
         """
         endpoint = f"{self.base_url}/qps/rest/2.0/search/am/hostasset"
-        all_results = []
+        host_elements = []
         offset = 1
         page = 1
-
-        logger.info(f"Starting search for installedSoftware {FILTER_OPERATOR} '{software_name}'")
+        logger.info(f"Starting HostAsset search for installedSoftware {FILTER_OPERATOR} '{software_name}'")
         while True:
             logger.info(f"Fetching page {page}, startFromOffset={offset}...")
             body = self.build_search_body(software_name, offset)
@@ -161,26 +137,24 @@ class QualysHostAssetSearcher:
                 verify=self.cert_path
             )
             if resp.status_code == 403:
-                logger.error("Search returned 403 Forbidden. Check Basic Auth or permissions.")
-                logger.debug(f"Response body:\n{resp.text}")
+                logger.error("Search returned 403 Forbidden. Check credentials/permissions.")
+                logger.debug(f"Response:\n{resp.text}")
                 raise Exception("403 Forbidden on search")
-
             try:
                 resp.raise_for_status()
             except Exception as e:
                 logger.error(f"Search HTTP error: {e}")
-                logger.debug(f"Response status: {resp.status_code}, body:\n{resp.text}")
+                logger.debug(f"Response: {resp.status_code}, body:\n{resp.text}")
                 raise
 
-            # Parse XML
+            # Parse response
             try:
                 root = ET.fromstring(resp.content)
             except ET.ParseError as e:
-                logger.error(f"Failed to parse search response XML: {e}")
+                logger.error(f"Failed parsing search response XML: {e}")
                 logger.debug(f"Response text:\n{resp.text}")
                 raise
 
-            # Check responseCode and total count
             resp_code = root.findtext("responseCode")
             total_count = root.findtext("count")
             logger.info(f"Search responseCode={resp_code}, reported count={total_count}")
@@ -188,32 +162,15 @@ class QualysHostAssetSearcher:
                 logger.error(f"Search responseCode not SUCCESS. Full response:\n{resp.text}")
                 raise Exception(f"Search API returned responseCode={resp_code}")
 
-            # Extract HostAsset entries
-            host_assets = root.findall(".//HostAsset")
-            count_page = len(host_assets)
+            # Get HostAsset elements
+            hes = root.findall(".//HostAsset")
+            count_page = len(hes)
             logger.info(f"Retrieved {count_page} HostAsset entries on page {page}")
             if count_page == 0:
                 break
 
-            # Parse each HostAsset entry
-            for ha in host_assets:
-                host_id = ha.findtext("id", default="")
-                dns = ha.findtext("dnsHostName", default="")
-                netbios = ha.findtext("netbiosName", default="")
-                # For each nested HostAssetSoftware entry
-                for sw in ha.findall(".//HostAssetSoftware"):
-                    name = sw.findtext("name", default="")
-                    version = sw.findtext("version", default="")
-                    # Append result row
-                    all_results.append({
-                        "id": host_id,
-                        "dnsHostName": dns,
-                        "netbiosName": netbios,
-                        "software": name,
-                        "version": version
-                    })
+            host_elements.extend(hes)
 
-            # Pagination: hasMoreRecords?
             has_more = root.findtext(".//hasMoreRecords") == "true"
             logger.info(f"hasMoreRecords = {has_more}")
             if not has_more:
@@ -221,12 +178,38 @@ class QualysHostAssetSearcher:
             offset += self.page_size
             page += 1
 
-        logger.info(f"Search completed. Total entries collected: {len(all_results)}")
-        return all_results
+        logger.info(f"Completed HostAsset search: total hosts found {len(host_elements)}")
+        return host_elements
+
+    def extract_exact_software(self, host_elem: ET.Element, software_name: str):
+        """
+        From a HostAsset element (which includes nested HostAssetSoftwareList),
+        pick only the HostAssetSoftware entries whose <name> exactly (case-insensitive) matches software_name.
+        Returns list of dicts (should be at most one per host).
+        """
+        host_id = host_elem.findtext("id", default="")
+        dns = host_elem.findtext("dnsHostName", default="")
+        netbios = host_elem.findtext("netbiosName", default="")
+        records = []
+        # Iterate nested HostAssetSoftware entries
+        for sw in host_elem.findall(".//HostAssetSoftware"):
+            name = (sw.findtext("name") or "").strip()
+            version = (sw.findtext("version") or "").strip()
+            # Exact match, case-insensitive:
+            if name.lower() == software_name.lower():
+                records.append({
+                    "id": host_id,
+                    "dnsHostName": dns,
+                    "netbiosName": netbios,
+                    "software": name,
+                    "version": version
+                })
+        return records  # may be empty if no exact match found (unlikely since search matched host)
 
     def run(self, software_name: str):
         """
-        Main flow: login, search, write CSV, logout.
+        Main flow: login, search hosts for software substring, but only output exact matches.
+        Write results to Excel.
         """
         try:
             self.login()
@@ -236,33 +219,49 @@ class QualysHostAssetSearcher:
 
         results = []
         try:
-            results = self.search(software_name)
-            if not results:
-                logger.warning(f"No entries found for installedSoftware containing '{software_name}'.")
+            host_elements = self.search_hosts(software_name)
+            if not host_elements:
+                logger.warning(f"No HostAssets found for installedSoftware containing '{software_name}'.")
             else:
-                out_filename = f"hostasset_{software_name.replace(' ', '_')}.csv"
-                logger.info(f"Writing {len(results)} entries to CSV: {out_filename}")
-                try:
-                    with open(out_filename, mode="w", newline="", encoding="utf-8") as f:
-                        fieldnames = ["id", "dnsHostName", "netbiosName", "software", "version"]
-                        writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        writer.writeheader()
-                        for row in results:
-                            writer.writerow(row)
-                    logger.info(f"CSV saved: {out_filename}")
-                except Exception as e:
-                    logger.error(f"Failed to write CSV: {e}")
+                total_hosts = len(host_elements)
+                logger.info(f"Extracting exact software entries from {total_hosts} hosts...")
+                for idx, he in enumerate(host_elements, start=1):
+                    try:
+                        recs = self.extract_exact_software(he, software_name)
+                        if recs:
+                            # Should typically be one record per host
+                            for rec in recs:
+                                results.append(rec)
+                            logger.info(f"[{idx}/{total_hosts}] HostID={he.findtext('id')} exact match found")
+                        else:
+                            # Host was matched by substring search but no exact entry? Possible if host asset software name is indexed differently.
+                            logger.info(f"[{idx}/{total_hosts}] HostID={he.findtext('id')} no exact match; skipping")
+                    except Exception as e:
+                        logger.error(f"[{idx}/{total_hosts}] Error extracting from HostAsset: {e}")
         finally:
             self.logout()
 
+        # Write to Excel if any results
+        if results:
+            df = pd.DataFrame(results)
+            # Filename e.g. software_Google_Chrome.xlsx
+            safe_name = software_name.replace(" ", "_")
+            out_filename = f"{safe_name}_hosts_exact.xlsx"
+            try:
+                df.to_excel(out_filename, index=False)
+                logger.info(f"Excel saved: {out_filename} (entries: {len(results)})")
+            except Exception as e:
+                logger.error(f"Failed to write Excel: {e}")
+        else:
+            logger.warning("No exact software entries found to write.")
 
 def main():
-    software_name = input("Enter software name to search (substring match): ").strip()
+    software_name = input("Enter the exact software name to search (case-insensitive exact match): ").strip()
     if not software_name:
         logger.error("Software name cannot be empty. Exiting.")
         sys.exit(1)
 
-    searcher = QualysHostAssetSearcher(USERNAME, PASSWORD, CERT_PATH, page_size=PAGE_SIZE)
+    searcher = QualysHostAssetExactSearcher(USERNAME, PASSWORD, CERT_PATH, page_size=PAGE_SIZE)
     searcher.run(software_name)
 
 
