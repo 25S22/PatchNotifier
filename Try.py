@@ -153,7 +153,7 @@ class QualysSearcher:
         for sw in host.findall(".//HostAssetSoftware"):
             name = (sw.findtext("name") or "").strip()
             ver_str = (sw.findtext("version") or "").strip()
-            if name.lower() == software_name.lower():
+            if software_name.lower() in name.lower():
                 found_software = True
                 try:
                     parsed_ver = version.parse(ver_str)
