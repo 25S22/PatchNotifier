@@ -113,14 +113,23 @@ class QualysSearcher:
     def extract_in_ranges(self, host, software_name, max_versions):
         """
         For a given host (Element), look for installed software entries matching software_name.
-        max_versions: list of strings like ["8.0.10", "9.0.12", ...].
-        For each found software version:
-         - If major/minor matches a max_version entry:
-            - lower bound = X.Y.0
-            - if ver <= max_version: status "Below target"
-            - else (ver > max_version): status "Up-to-date"
-         - If no max_version's major/minor matches this version: skip (do not include in output for that host software instance)
-        If software_name not found on host at all: return a single entry with Status "Not Found"
+        max_versions: list of strings like ["8.0.10", "9.0.12", ...] or a single-element list ["11.0.7"].
+
+        Behavior:
+        - If only one version in max_versions:
+            * parsed_max = version.parse(max_versions[0]).
+            * For every installed software entry whose name matches (we use substring match: software_name.lower() in name.lower()):
+                - parsed_ver = version.parse(ver_str). If parsed_ver < parsed_max => "Below target", else => "Up-to-date".
+            * If no matching software entries at all on this host => one row with Status "Not Found".
+        - If multiple versions in max_versions:
+            * Pre-parse each into (major, minor, parsed_lower, parsed_max).
+              parsed_lower = version.parse(f"{major}.{minor}.0") – grouping by first two segments.
+            * For each installed software entry matching name:
+                - parsed_ver = version.parse(ver_str).
+                - Check if parsed_ver.release has same major/minor as any range:
+                    - If so, compare parsed_ver <= parsed_max? "Below target" : "Up-to-date".
+                    - Skip versions whose major.minor are not in any specified range.
+            * If no matching software entries at all => one row with Status "Not Found".
         """
         matches = []
         host_id = host.findtext("id", "")
@@ -128,28 +137,96 @@ class QualysSearcher:
         netbios = host.findtext("netbiosName", "")
         found_software = False
 
-        # Pre-parse max_versions into tuples: (major:int, minor:int, parsed_max_version:Version)
-        ranges = []
-        for max_v in max_versions:
-            try:
-                parsed = version.parse(max_v)
-                # Extract major, minor from parsed.release
-                rel = parsed.release
-                if len(rel) >= 2:
-                    major, minor = rel[0], rel[1]
-                elif len(rel) == 1:
-                    major, minor = rel[0], 0
-                else:
-                    # fallback
-                    continue
-                lower_str = f"{major}.{minor}.0"
-                parsed_lower = version.parse(lower_str)
-                ranges.append((major, minor, parsed_lower, parsed))
-            except Exception:
-                logger.warning(f"Skipping invalid max_version '{max_v}'")
+        # Validate and parse max_versions
+        cleaned = []
+        for mv in max_versions:
+            mv = mv.strip()
+            if not mv:
                 continue
+            try:
+                parsed = version.parse(mv)
+                cleaned.append((mv, parsed))
+            except Exception:
+                logger.warning(f"Skipping invalid max_version '{mv}'")
+        if not cleaned:
+            # No valid versions: we skip all comparisons, return empty so host is effectively ignored.
+            return []
 
-        # If no valid ranges parsed, we treat as no filtering: nothing will be included.
+        # Single-version logic
+        if len(cleaned) == 1:
+            mv_str, parsed_max = cleaned[0]
+            # For substring matching in software name:
+            for sw in host.findall(".//HostAssetSoftware"):
+                name = (sw.findtext("name") or "").strip()
+                ver_str = (sw.findtext("version") or "").strip()
+                if software_name.lower() in name.lower():
+                    found_software = True
+                    try:
+                        parsed_ver = version.parse(ver_str)
+                    except Exception:
+                        logger.warning(f"Invalid version format: '{ver_str}' on host {host_id}")
+                        # Record as unparsed?
+                        matches.append({
+                            "Host ID": host_id,
+                            "DNS": dns,
+                            "NetBIOS": netbios,
+                            "Software": name,
+                            "Version": ver_str,
+                            "Status": "Unparsed",
+                            "Range": f"< {mv_str}"
+                        })
+                        continue
+
+                    # Compare across entire version:
+                    if parsed_ver < parsed_max:
+                        status = "Below target"
+                    else:
+                        status = "Up-to-date"
+                    matches.append({
+                        "Host ID": host_id,
+                        "DNS": dns,
+                        "NetBIOS": netbios,
+                        "Software": name,
+                        "Version": ver_str,
+                        "Status": status,
+                        "Range": f"< {mv_str}"
+                    })
+            if not found_software:
+                matches.append({
+                    "Host ID": host_id,
+                    "DNS": dns,
+                    "NetBIOS": netbios,
+                    "Software": software_name,
+                    "Version": "",
+                    "Status": "Not Found",
+                    "Range": ""
+                })
+            return matches
+
+        # Multiple-version (range) logic
+        # Pre-parse into (major, minor, parsed_lower, parsed_max) for grouping by major.minor
+        ranges = []
+        for mv_str, parsed in cleaned:
+            rel = getattr(parsed, "release", None)
+            if rel and len(rel) >= 2:
+                major, minor = rel[0], rel[1]
+            elif rel and len(rel) == 1:
+                major, minor = rel[0], 0
+            else:
+                # Cannot determine major/minor => skip
+                logger.warning(f"Cannot extract major/minor from '{mv_str}', skipping range logic for it.")
+                continue
+            lower_str = f"{major}.{minor}.0"
+            try:
+                parsed_lower = version.parse(lower_str)
+            except Exception:
+                parsed_lower = None
+            ranges.append((major, minor, parsed_lower, parsed, mv_str))
+
+        if not ranges:
+            # No usable ranges parsed; treat as no filtering
+            return []
+
         for sw in host.findall(".//HostAssetSoftware"):
             name = (sw.findtext("name") or "").strip()
             ver_str = (sw.findtext("version") or "").strip()
@@ -159,38 +236,37 @@ class QualysSearcher:
                     parsed_ver = version.parse(ver_str)
                 except Exception:
                     logger.warning(f"Invalid version format: '{ver_str}' on host {host_id}")
+                    # Optionally record unparsed
                     continue
 
-                # Determine if parsed_ver matches any of the ranges by major/minor
-                matched_range = False
-                for major, minor, parsed_lower, parsed_max in ranges:
-                    # only consider if same major.minor
-                    rv = parsed_ver.release
-                    if len(rv) >= 2 and rv[0] == major and rv[1] == minor:
-                        matched_range = True
-                        if parsed_ver <= parsed_max:
-                            status = "Below target"
-                        else:
-                            status = "Up-to-date"
-                        matches.append({
-                            "Host ID": host_id,
-                            "DNS": dns,
-                            "NetBIOS": netbios,
-                            "Software": name,
-                            "Version": ver_str,
-                            "Status": status,
-                            "Range": f"{major}.{minor}.0 - {parsed_max}"
-                        })
-                        break
-
-                # If version exists but its major.minor not in any specified ranges, skip including it.
-                # (Alternatively, you could record "Out of specified ranges" if desired.)
-                if not matched_range:
-                    # skip this version instance
+                # Find matching range by major.minor
+                matched = False
+                rv = getattr(parsed_ver, "release", None)
+                if rv and len(rv) >= 2:
+                    for major, minor, parsed_lower, parsed_max, mv_str in ranges:
+                        if rv[0] == major and rv[1] == minor:
+                            matched = True
+                            if parsed_ver <= parsed_max:
+                                status = "Below target"
+                            else:
+                                status = "Up-to-date"
+                            # Range description: e.g. "8.0.0 - 8.0.10"
+                            low_descr = f"{major}.{minor}.0"
+                            matches.append({
+                                "Host ID": host_id,
+                                "DNS": dns,
+                                "NetBIOS": netbios,
+                                "Software": name,
+                                "Version": ver_str,
+                                "Status": status,
+                                "Range": f"{low_descr} - {mv_str}"
+                            })
+                            break
+                # If version's major.minor not in any specified ranges => skip
+                if not matched:
                     pass
 
         if not found_software:
-            # if you want to include hosts without the software, uncomment below:
             matches.append({
                 "Host ID": host_id,
                 "DNS": dns,
@@ -200,18 +276,17 @@ class QualysSearcher:
                 "Status": "Not Found",
                 "Range": ""
             })
-
         return matches
 
     def send_email(self, filename, software_name, max_versions):
         outlook = win32.Dispatch("Outlook.Application")
         mail = outlook.CreateItem(0)
         joined_max = "/".join(max_versions)
-        mail.Subject = f"[PATCH ALERT] Devices with {software_name} in ranges {joined_max}"
+        mail.Subject = f"[PATCH ALERT] Devices with {software_name} (max: {joined_max})"
         mail.Body = f"""
 Hello,
 
-Please find attached the list of devices where '{software_name}' is installed with versions in or above the specified ranges '{joined_max}', indicating below-target or up-to-date statuses.
+Please find attached the list of devices where '{software_name}' is installed, evaluated against specified version(s) '{joined_max}', indicating below-target or up-to-date statuses.
 
 Take appropriate patching action.
 
@@ -224,9 +299,8 @@ Patch Automation System
     def run(self, software_name, max_versions):
         """
         software_name: str
-        max_versions: list of strings, e.g. ["8.0.10", "9.0.12", "10.1.2"]
+        max_versions: list of strings, e.g. ["11.0.7"] or ["8.0.10","9.0.12","10.1.2"]
         """
-        # Login
         self.login()
         try:
             hosts = self.search_hosts(software_name)
@@ -234,55 +308,49 @@ Patch Automation System
             all_matches = []
             for i, host in enumerate(hosts, 1):
                 matches = self.extract_in_ranges(host, software_name, max_versions)
-                # Only add if matches non-empty
                 if matches:
                     all_matches.extend(matches)
                 if i % 100 == 0:
                     logger.info(f"Processed {i}/{len(hosts)} hosts")
 
             if not all_matches:
-                logger.info("No matching records found for the specified ranges.")
-                # Still create an empty file to show structure
+                logger.info("No matching records found for the specified version(s).")
                 df_empty = pd.DataFrame(columns=["Host ID", "DNS", "NetBIOS", "Software", "Version", "Status", "Range"])
-                filename = f"{software_name.replace(' ', '_')}_ranges_{'_'.join(max_versions)}.xlsx"
+                filename = f"{software_name.replace(' ', '_')}_versions_{'_'.join(max_versions)}.xlsx"
                 df_empty.to_excel(filename, index=False)
                 logger.info(f"Saved empty Excel: {filename}")
-                # Optionally send an email even if empty
+                # Optionally send email for empty
                 self.send_email(filename, software_name, max_versions)
                 return
 
             df = pd.DataFrame(all_matches)
             # Sort so that "Below target" come first, then "Up-to-date", then "Not Found" if present.
-            # Define categorical ordering
             cat_type = pd.CategoricalDtype(categories=["Below target", "Up-to-date", "Not Found"], ordered=True)
             if "Status" in df.columns:
                 df["Status"] = df["Status"].astype(cat_type)
-                df = df.sort_values(by=["Status", "Host ID"])  # secondary sort by Host ID, if desired
+                df = df.sort_values(by=["Status", "Host ID"])
 
-            # Save to Excel
-            filename = f"{software_name.replace(' ', '_')}_ranges_{'_'.join(max_versions)}.xlsx"
+            filename = f"{software_name.replace(' ', '_')}_versions_{'_'.join(max_versions)}.xlsx"
             df.to_excel(filename, index=False)
             logger.info(f"Saved Excel: {filename}")
-            # Send email with attachment
             self.send_email(filename, software_name, max_versions)
         finally:
             self.logout()
 
 
 def main():
-    software = input("Enter software name (case-insensitive exact match): ").strip()
-    max_ver_input = input("Enter max allowed versions separated by '/': ").strip()
+    software = input("Enter software name (case-insensitive substring match): ").strip()
+    max_ver_input = input("Enter version(s) separated by '/': ").strip()
     if not software or not max_ver_input:
         print("Missing software/version input.")
         sys.exit(1)
 
-    # Split and strip; e.g. "8.0.10/9.0.12/10.1.2"
     max_versions = [v.strip() for v in max_ver_input.split("/") if v.strip()]
     if not max_versions:
         print("No valid versions parsed.")
         sys.exit(1)
 
-    # Optional: Validate each version string can be parsed
+    # Optional: validate parseable, but extract_in_ranges also checks
     valid_versions = []
     for v in max_versions:
         try:
