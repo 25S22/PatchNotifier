@@ -6,7 +6,7 @@ import logging
 import sys
 
 from cve import fetch_recent_cves, ensure_audit_folder_exists, load_applications, save_audit_log
-from qualys import QualysSearcher
+from qualys import QualysSearcher, USERNAME as QUALYS_USERNAME, PASSWORD as QUALYS_PASSWORD, CERT_PATH as QUALYS_CERT_PATH
 
 # === CONFIGURATION ===
 # Optionally override number of days back via CLI arg
@@ -27,8 +27,12 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
     # Load monitored applications
     applications = load_applications()
 
-    # Instantiate QualysSearcher once
-    qs = QualysSearcher()
+    # Instantiate QualysSearcher once with credentials
+    qs = QualysSearcher(
+        username=QUALYS_USERNAME,
+        password=QUALYS_PASSWORD,
+        cert_path=QUALYS_CERT_PATH
+    )
 
     for app in applications:
         product = app.get("product")
