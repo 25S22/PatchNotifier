@@ -6,11 +6,13 @@ import logging
 import sys
 
 from cve import fetch_recent_cves, ensure_audit_folder_exists, load_applications, save_audit_log
-from qualys import QualysSearcher, USERNAME as QUALYS_USERNAME, PASSWORD as QUALYS_PASSWORD, CERT_PATH as QUALYS_CERT_PATH, PAGE_SIZE as QUALYS_PAGE_SIZE
+from qualys import QualysSearcher, USERNAME as QUALYS_USERNAME, PASSWORD as QUALYS_PASSWORD, CERT_PATH as QUALYS_CERT_PATH
 
 # === CONFIGURATION ===
 # Optionally override number of days back via CLI arg
 DAYS_BACK = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+# Override Qualys page size (e.g., 1000)
+QUALYS_PAGE_SIZE = 1000  
 
 # === LOGGER SETUP ===
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -19,21 +21,26 @@ logger = logging.getLogger()
 
 def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
     """
-    Runs the CVE scanner (cve.py), logs results, then for each CVE entry with a known version,
-    invokes QualysSearcher (from qualys.py) to generate the version report and dispatch the email.
+    Runs the CVE scanner, logs results, then for each CVE entry with a known version,
+    invokes QualysSearcher to generate the version report and dispatch the email.
+    Fixes paging size and suppresses duplicate logging.
     """
     logger.info("Starting integrated CVE→Qualys workflow (last %d days)...", days_back)
 
     # Load monitored applications
     applications = load_applications()
 
-    # Instantiate QualysSearcher once with credentials and page size
+    # Instantiate QualysSearcher with desired page size
     qs = QualysSearcher(
         username=QUALYS_USERNAME,
         password=QUALYS_PASSWORD,
         cert_path=QUALYS_CERT_PATH,
         page_size=QUALYS_PAGE_SIZE
     )
+
+    # Suppress duplicate QualysFilteredSearch logs
+    qualys_logger = logging.getLogger("QualysFilteredSearch")
+    qualys_logger.propagate = False
 
     for app in applications:
         product = app.get("product")
