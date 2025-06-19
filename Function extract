@@ -55,7 +55,10 @@ class QualysSearcher:
     def logout(self):
         url = f"{self.base_url}/api/2.0/fo/session/"
         data = {"action": "logout"}
-        self.session.post(url, headers=self.fo_headers, data=data, verify=self.cert_path)
+        try:
+            self.session.post(url, headers=self.fo_headers, data=data, verify=self.cert_path)
+        except Exception:
+            pass
         logger.info("Logged out.")
 
     def build_request(self, software_name, offset):
@@ -107,109 +110,296 @@ class QualysSearcher:
 
         return results
 
-    def extract_below_version(self, host, software_name, max_version):
+    def extract_in_ranges(self, host, software_name, max_versions):
+        """
+        For a given host (Element), look for installed software entries matching software_name.
+        max_versions: list of strings like ["8.0.10", "9.0.12", ...] or a single-element list ["11.0.7"].
+
+        Behavior:
+        - If only one version in max_versions:
+            * parsed_max = version.parse(max_versions[0]).
+            * For every installed software entry whose name matches (we use substring match: software_name.lower() in name.lower()):
+                - parsed_ver = version.parse(ver_str). If parsed_ver < parsed_max => "Below target", else => "Up-to-date".
+            * If no matching software entries at all on this host => one row with Status "Not Found".
+        - If multiple versions in max_versions:
+            * Pre-parse each into (major, minor, parsed_lower, parsed_max).
+              parsed_lower = version.parse(f"{major}.{minor}.0") – grouping by first two segments.
+            * For each installed software entry matching name:
+                - parsed_ver = version.parse(ver_str).
+                - Check if parsed_ver.release has same major/minor as any range:
+                    - If so, compare parsed_ver <= parsed_max? "Below target" : "Up-to-date".
+                    - Skip versions whose major.minor are not in any specified range.
+            * If no matching software entries at all => one row with Status "Not Found".
+        """
         matches = []
         host_id = host.findtext("id", "")
         dns = host.findtext("dnsHostName", "")
         netbios = host.findtext("netbiosName", "")
-        found = False
+        found_software = False
 
-        for sw in host.findall(".//HostAssetSoftware"):
-            name = (sw.findtext("name") or "").strip()
-            ver = (sw.findtext("version") or "").strip()
+        # Validate and parse max_versions
+        cleaned = []
+        for mv in max_versions:
+            mv = mv.strip()
+            if not mv:
+                continue
+            try:
+                parsed = version.parse(mv)
+                cleaned.append((mv, parsed))
+            except Exception:
+                logger.warning(f"Skipping invalid max_version '{mv}'")
+        if not cleaned:
+            # No valid versions: we skip all comparisons, return empty so host is effectively ignored.
+            return []
 
-            if name.lower() == software_name.lower():
-                found = True
-                try:
-                    if version.parse(ver) < version.parse(max_version):
+        # Single-version logic
+        if len(cleaned) == 1:
+            mv_str, parsed_max = cleaned[0]
+            # For substring matching in software name:
+            for sw in host.findall(".//HostAssetSoftware"):
+                name = (sw.findtext("name") or "").strip()
+                ver_str = (sw.findtext("version") or "").strip()
+                if software_name.lower() in name.lower():
+                    found_software = True
+                    try:
+                        parsed_ver = version.parse(ver_str)
+                    except Exception:
+                        logger.warning(f"Invalid version format: '{ver_str}' on host {host_id}")
+                        # Record as unparsed
                         matches.append({
                             "Host ID": host_id,
                             "DNS": dns,
                             "NetBIOS": netbios,
                             "Software": name,
-                            "Version": ver,
-                            "Status": "Below target"
+                            "Version": ver_str,
+                            "Status": "Unparsed",
+                            "Range": f"< {mv_str}"
                         })
+                        continue
+
+                    # Compare across entire version:
+                    if parsed_ver < parsed_max:
+                        status = "Below target"
                     else:
-                        matches.append({
-                            "Host ID": host_id,
-                            "DNS": dns,
-                            "NetBIOS": netbios,
-                            "Software": name,
-                            "Version": ver,
-                            "Status": "Up-to-date"
-                        })
-                except Exception as e:
-                    logger.warning(f"Invalid version format: {ver} on host {host_id}")
+                        status = "Up-to-date"
                     matches.append({
                         "Host ID": host_id,
                         "DNS": dns,
                         "NetBIOS": netbios,
                         "Software": name,
-                        "Version": ver,
-                        "Status": "Unparsed"
+                        "Version": ver_str,
+                        "Status": status,
+                        "Range": f"< {mv_str}"
                     })
+            if not found_software:
+                matches.append({
+                    "Host ID": host_id,
+                    "DNS": dns,
+                    "NetBIOS": netbios,
+                    "Software": software_name,
+                    "Version": "",
+                    "Status": "Not Found",
+                    "Range": ""
+                })
+            return matches
 
-        if not found:
+        # Multiple-version (range) logic
+        # Pre-parse into (major, minor, parsed_lower, parsed_max) for grouping by major.minor
+        ranges = []
+        for mv_str, parsed in cleaned:
+            rel = getattr(parsed, "release", None)
+            if rel and len(rel) >= 2:
+                major, minor = rel[0], rel[1]
+            elif rel and len(rel) == 1:
+                major, minor = rel[0], 0
+            else:
+                # Cannot determine major/minor => skip
+                logger.warning(f"Cannot extract major/minor from '{mv_str}', skipping range logic for it.")
+                continue
+            lower_str = f"{major}.{minor}.0"
+            try:
+                parsed_lower = version.parse(lower_str)
+            except Exception:
+                parsed_lower = None
+            ranges.append((major, minor, parsed_lower, parsed, mv_str))
+
+        if not ranges:
+            # No usable ranges parsed; treat as no filtering
+            return []
+
+        for sw in host.findall(".//HostAssetSoftware"):
+            name = (sw.findtext("name") or "").strip()
+            ver_str = (sw.findtext("version") or "").strip()
+            if software_name.lower() in name.lower():
+                found_software = True
+                try:
+                    parsed_ver = version.parse(ver_str)
+                except Exception:
+                    logger.warning(f"Invalid version format: '{ver_str}' on host {host_id}")
+                    # Optionally record unparsed
+                    continue
+
+                # Find matching range by major.minor
+                matched = False
+                rv = getattr(parsed_ver, "release", None)
+                if rv and len(rv) >= 2:
+                    for major, minor, parsed_lower, parsed_max, mv_str in ranges:
+                        if rv[0] == major and rv[1] == minor:
+                            matched = True
+                            if parsed_ver <= parsed_max:
+                                status = "Below target"
+                            else:
+                                status = "Up-to-date"
+                            # Range description: e.g. "8.0.0 - 8.0.10"
+                            low_descr = f"{major}.{minor}.0"
+                            matches.append({
+                                "Host ID": host_id,
+                                "DNS": dns,
+                                "NetBIOS": netbios,
+                                "Software": name,
+                                "Version": ver_str,
+                                "Status": status,
+                                "Range": f"{low_descr} - {mv_str}"
+                            })
+                            break
+                # If version's major.minor not in any specified ranges => skip
+                if not matched:
+                    pass
+
+        if not found_software:
             matches.append({
                 "Host ID": host_id,
                 "DNS": dns,
                 "NetBIOS": netbios,
                 "Software": software_name,
                 "Version": "",
-                "Status": "Not Found"
+                "Status": "Not Found",
+                "Range": ""
             })
-
         return matches
 
-    def send_email(self, filename, software_name, max_version):
-        outlook = win32.Dispatch("Outlook.Application")
-        mail = outlook.CreateItem(0)
-        mail.Subject = f"[PATCH ALERT] Devices with {software_name} below version {max_version}"
-        mail.Body = f"""
+    def send_email(self, filename, software_name, max_versions, below_target_count):
+        # Only send email if there are hosts below target version
+        if below_target_count > 0:
+            outlook = win32.Dispatch("Outlook.Application")
+            mail = outlook.CreateItem(0)
+            joined_max = "/".join(max_versions)
+            mail.Subject = f"[PATCH ALERT] {below_target_count} Devices with {software_name} below target versions"
+            
+            range_note = ""
+            if len(max_versions) > 1:
+                range_note = f"\nNote: Using range-based filtering across multiple version targets: {joined_max}"
+            
+            mail.Body = f"""
 Hello,
 
-Please find attached the list of devices where '{software_name}' is installed with versions below the required '{max_version}'.
+Please find attached the list of devices where '{software_name}' is installed, evaluated against specified version(s) '{joined_max}'.
+
+Found {below_target_count} devices that need patching.{range_note}
 
 Take appropriate patching action.
 
 Regards,
 Patch Automation System
-        """.strip()
-        mail.Attachments.Add(os.path.abspath(filename))
-        mail.Display()  # Opens the draft
+            """.strip()
+            mail.Attachments.Add(os.path.abspath(filename))
+            mail.Display()  # Opens the draft
+            logger.info(f"Email draft created for {below_target_count} devices below target version.")
+        else:
+            logger.info("No devices below target version found - email not created.")
 
-    def run(self, software_name, max_version):
+    def run(self, software_name, max_versions):
+        """
+        software_name: str
+        max_versions: list of strings, e.g. ["11.0.7"] or ["8.0.10","9.0.12","10.1.2"]
+        """
         self.login()
         try:
             hosts = self.search_hosts(software_name)
             logger.info(f"Found {len(hosts)} hosts.")
+            
+            if not hosts:
+                logger.info("No hosts found with the specified software.")
+                # Still create empty Excel file for tracking
+                df_empty = pd.DataFrame(columns=["Host ID", "DNS", "NetBIOS", "Software", "Version", "Status", "Range"])
+                filename = f"{software_name.replace(' ', '_')}_versions_{'_'.join(max_versions)}.xlsx"
+                df_empty.to_excel(filename, index=False)
+                logger.info(f"Empty Excel file created: {filename}")
+                return
+            
             all_matches = []
             for i, host in enumerate(hosts, 1):
-                matches = self.extract_below_version(host, software_name, max_version)
-                all_matches.extend(matches)
+                matches = self.extract_in_ranges(host, software_name, max_versions)
+                if matches:
+                    all_matches.extend(matches)
                 if i % 100 == 0:
                     logger.info(f"Processed {i}/{len(hosts)} hosts")
 
-            df = pd.DataFrame(all_matches)
-            filename = f"{software_name.replace(' ', '_')}_below_{max_version}.xlsx"
-            df.to_excel(filename, index=False)
-            logger.info(f"Saved Excel: {filename}")
-            self.send_email(filename, software_name, max_version)
+            # Always create Excel file - even if no matches found
+            if not all_matches:
+                logger.info("No matching software records found for the specified version(s).")
+                df_empty = pd.DataFrame(columns=["Host ID", "DNS", "NetBIOS", "Software", "Version", "Status", "Range"])
+                filename = f"{software_name.replace(' ', '_')}_versions_{'_'.join(max_versions)}.xlsx"
+                df_empty.to_excel(filename, index=False)
+                logger.info(f"Saved empty Excel: {filename}")
+                # Don't send email for completely empty results
+                return
 
+            df = pd.DataFrame(all_matches)
+            # Sort so that "Below target" come first, then "Up-to-date", then "Not Found" if present.
+            cat_type = pd.CategoricalDtype(categories=["Below target", "Up-to-date", "Not Found", "Unparsed"], ordered=True)
+            if "Status" in df.columns:
+                df["Status"] = df["Status"].astype(cat_type)
+                df = df.sort_values(by=["Status", "Host ID"])
+
+            filename = f"{software_name.replace(' ', '_')}_versions_{'_'.join(max_versions)}.xlsx"
+            df.to_excel(filename, index=False)
+            
+            # Count devices below target
+            below_target_count = len(df[df['Status'] == 'Below target']) if 'Status' in df.columns else 0
+            total_count = len(df)
+            
+            logger.info(f"Results Summary:")
+            logger.info(f"    Total software installations found: {total_count}")
+            logger.info(f"    Installations below target version: {below_target_count}")
+            logger.info(f"Saved Excel: {filename}")
+            
+            if len(max_versions) > 1:
+                logger.info(f"Note: Using range-based filtering across multiple version targets: {'/'.join(max_versions)}")
+            
+            # Send email only if there are devices below target
+            self.send_email(filename, software_name, max_versions, below_target_count)
+            
         finally:
             self.logout()
 
 
 def main():
-    software = input("Enter software name (case-insensitive exact match): ").strip()
-    max_ver = input("Enter max allowed version (e.g., 117.0.0): ").strip()
-    if not software or not max_ver:
+    software = input("Enter software name (case-insensitive substring match): ").strip()
+    max_ver_input = input("Enter version(s) separated by '/': ").strip()
+    if not software or not max_ver_input:
         print("Missing software/version input.")
         sys.exit(1)
 
+    max_versions = [v.strip() for v in max_ver_input.split("/") if v.strip()]
+    if not max_versions:
+        print("No valid versions parsed.")
+        sys.exit(1)
+
+    # Optional: validate parseable, but extract_in_ranges also checks
+    valid_versions = []
+    for v in max_versions:
+        try:
+            _ = version.parse(v)
+            valid_versions.append(v)
+        except Exception:
+            print(f"Warning: '{v}' is not a valid version string and will be skipped.")
+    if not valid_versions:
+        print("No valid version strings provided.")
+        sys.exit(1)
+
     qs = QualysSearcher(USERNAME, PASSWORD, CERT_PATH, page_size=PAGE_SIZE)
-    qs.run(software, max_ver)
+    qs.run(software, valid_versions)
 
 
 if __name__ == "__main__":
