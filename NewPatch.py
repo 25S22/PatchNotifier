@@ -7,14 +7,14 @@ import sys
 import os
 import win32com.client as win32
 from datetime import datetime
-import json
+import getpass
 
-# === CONFIGURATION ===
-USERNAME = "your_qualys_username"
-PASSWORD = "your_qualys_password"
-CERT_PATH = "/path/to/your/corporate_cert.pem"  # Path to PEM bundle if needed, or set to False for testing
-BASE_URL = "https://qualysapi.qg1.apps.qualys.in"  # Adjust to your region's API endpoint
-PAGE_SIZE = 100  # If FO API supports pagination parameters; may not be used directly here
+# === CONFIGURATION DEFAULTS ===
+# You may hardcode defaults here, or leave as None to always prompt:
+DEFAULT_USERNAME = None  # e.g., "your_qualys_username"
+DEFAULT_PASSWORD = None  # e.g., "your_qualys_password"
+DEFAULT_CERT_PATH = None  # e.g., "/path/to/your/corporate_cert.pem"
+DEFAULT_BASE_URL = None  # e.g., "https://qualysapi.qg1.apps.qualys.in"
 LOG_LEVEL = logging.INFO
 
 # === LOGGER SETUP ===
@@ -28,13 +28,14 @@ logger.setLevel(LOG_LEVEL)
 
 
 class QualysCVESearcher:
-    def __init__(self, username, password, cert_path, base_url=None):
-        self.base_url = (base_url or BASE_URL).rstrip("/")
+    def __init__(self, username, password, cert_path, base_url):
+        self.base_url = base_url.rstrip("/") if base_url else None
+        if not self.base_url:
+            raise ValueError("Base URL must be provided.")
         self.session = requests.Session()
         self.auth = HTTPBasicAuth(username, password)
         # If certificate verification requires a custom bundle, set cert_path; else for testing you can set False
         self.cert_path = cert_path
-        # Common headers
         self.fo_headers = {"X-Requested-With": "Python script"}
         self.qps_headers = {
             "Content-Type": "application/xml",
@@ -80,6 +81,9 @@ class QualysCVESearcher:
         all_results = []
 
         for cve_id in cve_ids:
+            cve_id = cve_id.strip()
+            if not cve_id:
+                continue
             logger.info(f"Searching for hosts vulnerable to {cve_id}...")
             params = {
                 "action": "list",
@@ -93,7 +97,7 @@ class QualysCVESearcher:
                 resp = self.session.get(url, headers=self.fo_headers, params=params, verify=self.cert_path)
                 resp.raise_for_status()
             except Exception as e:
-                logger.error(f"Error fetching detections for {cve_id}: {str(e)}; response: {getattr(e, 'response', None)}")
+                logger.error(f"Error fetching detections for {cve_id}: {e}")
                 continue
 
             # Parse XML
@@ -103,23 +107,6 @@ class QualysCVESearcher:
                 logger.error(f"Failed to parse XML for CVE {cve_id}. Raw response:\n{resp.text}")
                 continue
 
-            # The typical structure:
-            # <HOST_LIST>
-            #   <HOST>
-            #     <ID>...</ID>
-            #     <IP>...</IP>
-            #     <DNS>...</DNS>
-            #     <NETBIOS>...</NETBIOS>
-            #     <OS>...</OS>
-            #     <VULN_DETECTION_LIST>
-            #       <DETECTION> ... </DETECTION>
-            #       ...
-            #     </VULN_DETECTION_LIST>
-            #   </HOST>
-            #   ...
-            # </HOST_LIST>
-            #
-            # But the exact tag names can vary; we search generically for HOST elements.
             hosts = root.findall(".//HOST")
             logger.info(f"Found {len(hosts)} HOST entries in response for {cve_id}")
 
@@ -128,17 +115,14 @@ class QualysCVESearcher:
                 host_dns = host.findtext("DNS", "")
                 host_netbios = host.findtext("NETBIOS", "")
                 host_os = host.findtext("OS", "")
-                host_id = host.findtext("ID", "")  # sometimes HOST ID may be under <ID>
+                host_id = host.findtext("ID", "")
 
-                # Search DETECTION elements under this HOST
                 detections = host.findall(".//DETECTION")
                 if not detections:
-                    # In some responses, detection may be nested differently or absent
                     logger.debug(f"No DETECTION found under HOST {host_ip} for CVE {cve_id}")
                     continue
 
                 for det in detections:
-                    # Extract fields from DETECTION element
                     det_qid = det.findtext("QID", "")
                     det_title = det.findtext("TITLE", "")
                     det_severity = det.findtext("SEVERITY", "")
@@ -148,7 +132,6 @@ class QualysCVESearcher:
                     det_last = det.findtext("LAST_FOUND_DATETIME", "") or det.findtext("LAST_FOUND", "")
                     det_status = det.findtext("STATUS", "")
                     det_results = det.findtext("RESULTS", "") or ""
-                    # Truncate long results text for summary columns
                     det_results_summary = det_results[:500] + "..." if len(det_results) > 500 else det_results
 
                     entry = {
@@ -170,7 +153,7 @@ class QualysCVESearcher:
                     }
                     all_results.append(entry)
 
-            logger.info(f"Total vulnerable host entries collected for {cve_id}: {len(all_results)}")
+            logger.info(f"Collected {len(all_results)} total detection entries so far (including previous CVEs).")
 
         return all_results
 
@@ -216,7 +199,6 @@ Vulnerability Management System
                 mail.Attachments.Add(abs_path)
             except Exception as e:
                 logger.error(f"Failed to attach file {filename}: {e}")
-            # Display draft for user to review/send
             mail.Display()
             logger.info(f"Email draft created for {vulnerable_count} vulnerable hosts.")
         else:
@@ -237,7 +219,6 @@ Vulnerability Management System
             results_list = self.get_host_list_detection(cve_ids)
             if not results_list:
                 logger.info("No vulnerable hosts found for the specified CVE(s). Creating an empty report.")
-                # Create empty DataFrame with expected columns
                 columns = [
                     "CVE", "Host ID", "IP Address", "DNS Name", "NetBIOS Name",
                     "Operating System", "QID", "Vulnerability Title", "Severity",
@@ -249,18 +230,15 @@ Vulnerability Management System
                 filename = f"CVE_Vulnerability_Report_{'_'.join([c.replace('CVE-', '') for c in cve_ids])}_{timestamp}.xlsx"
                 df_empty.to_excel(filename, index=False)
                 logger.info(f"Empty Excel file created: {filename}")
-                # No email since no vulnerabilities
                 return
 
             # Build DataFrame
             df = pd.DataFrame(results_list)
 
-            # Sort by severity if present: Qualys returns severity numeric as string "5","4",...
+            # Sort by severity if present
             if "Severity" in df.columns:
-                # Define ordering: Critical=5, High=4, etc.
                 severity_order = ["5", "4", "3", "2", "1"]
                 df["Severity_Sort"] = pd.Categorical(df["Severity"], categories=severity_order, ordered=True)
-                # Sort by Severity, then Host ID, then CVE
                 sort_cols = ["Severity_Sort"]
                 if "Host ID" in df.columns:
                     sort_cols.append("Host ID")
@@ -273,15 +251,13 @@ Vulnerability Management System
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"CVE_Vulnerability_Report_{'_'.join([c.replace('CVE-', '') for c in cve_ids])}_{timestamp}.xlsx"
 
-            # Save to Excel with multiple sheets: Details and Summary
+            # Save to Excel
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                # Details sheet
                 df.to_excel(writer, sheet_name='Vulnerability Details', index=False)
 
                 # Summary sheet
                 unique_hosts = df["Host ID"].nunique() if "Host ID" in df.columns else 0
                 total_instances = len(df)
-                # Count by severity
                 summary_data = {
                     "Metric": [
                         "Total CVEs Searched",
@@ -320,37 +296,96 @@ Vulnerability Management System
             self.send_email(filename, cve_ids, vulnerable_hosts_count, total_instances)
 
         finally:
-            # Ensure logout even on error
             try:
                 self.logout()
             except Exception as e:
                 logger.warning(f"Error during logout: {e}")
 
 
+def prompt_non_empty(prompt_text, default=None, is_password=False):
+    """
+    Prompt the user for input until a non-empty value is entered.
+    If default is provided and user enters empty, returns default.
+    If is_password=True, uses getpass.
+    """
+    while True:
+        if is_password:
+            val = getpass.getpass(prompt_text + (f" [default hidden]" if default else "") + ": ")
+        else:
+            val = input(prompt_text + (f" [default: {default}]" if default else "") + ": ")
+        if val:
+            return val
+        if default is not None:
+            return default
+        print("Input cannot be empty. Please try again.")
+
+
 if __name__ == "__main__":
-    # Example usage:
-    # Read CVE IDs from command-line arguments or a JSON file, etc.
-    # For demonstration, we pick some CVEs:
-    import argparse
+    # Interactive prompts
 
-    parser = argparse.ArgumentParser(description="Qualys CVE Vulnerability Searcher")
-    parser.add_argument("--cves", nargs="+", required=True,
-                        help="List of CVE IDs to search, e.g. CVE-2024-1234 CVE-2024-5678")
-    parser.add_argument("--username", default=USERNAME, help="Qualys username")
-    parser.add_argument("--password", default=PASSWORD, help="Qualys password")
-    parser.add_argument("--cert", default=CERT_PATH, help="Path to corporate cert PEM or False")
-    parser.add_argument("--base-url", default=BASE_URL, help="Qualys API base URL")
-    args = parser.parse_args()
+    print("=== Qualys CVE Vulnerability Searcher ===")
 
-    # Optionally override via env or args
-    searcher = QualysCVESearcher(
-        username=args.username,
-        password=args.password,
-        cert_path=(False if str(args.cert).lower() in ("false","none","") else args.cert),
-        base_url=args.base_url
-    )
+    # 1. Prompt for Qualys API base URL
+    base_url = DEFAULT_BASE_URL or input("Enter Qualys API Base URL (e.g., https://qualysapi.qg1.apps.qualys.in): ").strip()
+    while not base_url:
+        print("Base URL is required.")
+        base_url = input("Enter Qualys API Base URL: ").strip()
+
+    # 2. Prompt for username
+    if DEFAULT_USERNAME:
+        username = DEFAULT_USERNAME
+        print(f"Using default username: {username}")
+    else:
+        username = prompt_non_empty("Enter Qualys username")
+
+    # 3. Prompt for password (hidden)
+    if DEFAULT_PASSWORD:
+        password = DEFAULT_PASSWORD
+        # Note: we don't print default password
+    else:
+        password = prompt_non_empty("Enter Qualys password", is_password=True)
+
+    # 4. Prompt for certificate path or skip
+    if DEFAULT_CERT_PATH is not None:
+        cert_path = DEFAULT_CERT_PATH
+        print(f"Using default certificate path: {cert_path}")
+    else:
+        cert_input = input("Enter path to corporate cert PEM (or leave blank to skip verification): ").strip()
+        if cert_input:
+            cert_path = cert_input
+        else:
+            cert_path = False  # skip SSL verification
+            print("SSL verification will be skipped (verify=False).")
+
+    # 5. Prompt for CVE IDs
+    # Ask user to enter one or more CVEs, separated by commas or spaces
+    while True:
+        cve_input = input("Enter CVE ID(s), separated by commas or spaces (e.g., CVE-2024-1234, CVE-2024-5678): ").strip()
+        if not cve_input:
+            print("Please enter at least one CVE ID.")
+            continue
+        # Split by commas or spaces
+        # First replace commas with spaces, then split on whitespace
+        cve_input_clean = cve_input.replace(",", " ")
+        cve_list = [c.strip().upper() for c in cve_input_clean.split() if c.strip()]
+        if not cve_list:
+            print("No valid CVE IDs found in input. Please try again.")
+            continue
+        # Optionally, simple validation: ensure each starts with "CVE-"
+        invalids = [c for c in cve_list if not c.startswith("CVE-")]
+        if invalids:
+            print(f"Warning: The following entries do not look like CVE IDs: {invalids}")
+            confirm = input("Proceed with these anyway? (y/N): ").strip().lower()
+            if confirm != "y":
+                continue
+        break
+
+    print(f"Will search for CVE(s): {cve_list}")
+
+    # Instantiate and run
     try:
-        searcher.run_cve_search(args.cves)
+        searcher = QualysCVESearcher(username=username, password=password, cert_path=cert_path, base_url=base_url)
+        searcher.run_cve_search(cve_list)
     except Exception as e:
         logger.error(f"Exception during CVE search: {e}")
-        sys.exit(1)
+        sys.exit(1)n
