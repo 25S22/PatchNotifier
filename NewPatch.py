@@ -2,20 +2,19 @@ import requests
 import xml.etree.ElementTree as ET
 from requests.auth import HTTPBasicAuth
 import pandas as pd
-from packaging import version
 import logging
 import sys
 import os
 import win32com.client as win32
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 
 # === CONFIGURATION ===
 USERNAME = "your_qualys_username"
 PASSWORD = "your_qualys_password"
-CERT_PATH = "/path/to/your/corporate_cert.pem"
-BASE_URL = "https://qualysapi.qg1.apps.qualys.in"
-PAGE_SIZE = 100
+CERT_PATH = "/path/to/your/corporate_cert.pem"  # Path to PEM bundle if needed, or set to False for testing
+BASE_URL = "https://qualysapi.qg1.apps.qualys.in"  # Adjust to your region's API endpoint
+PAGE_SIZE = 100  # If FO API supports pagination parameters; may not be used directly here
 LOG_LEVEL = logging.INFO
 
 # === LOGGER SETUP ===
@@ -23,16 +22,19 @@ logger = logging.getLogger("QualysCVESearcher")
 handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter("[%(levelname)s] %(message)s")
 handler.setFormatter(formatter)
-logger.addHandler(handler)
+if not logger.handlers:
+    logger.addHandler(handler)
 logger.setLevel(LOG_LEVEL)
 
+
 class QualysCVESearcher:
-    def __init__(self, username, password, cert_path, page_size=100):
-        self.base_url = BASE_URL.rstrip("/")
+    def __init__(self, username, password, cert_path, base_url=None):
+        self.base_url = (base_url or BASE_URL).rstrip("/")
         self.session = requests.Session()
         self.auth = HTTPBasicAuth(username, password)
+        # If certificate verification requires a custom bundle, set cert_path; else for testing you can set False
         self.cert_path = cert_path
-        self.page_size = page_size
+        # Common headers
         self.fo_headers = {"X-Requested-With": "Python script"}
         self.qps_headers = {
             "Content-Type": "application/xml",
@@ -40,297 +42,161 @@ class QualysCVESearcher:
         }
 
     def login(self):
-        """Login to Qualys API and establish session"""
+        """Login to Qualys API via FO session API."""
         url = f"{self.base_url}/api/2.0/fo/session/"
         data = {
             "action": "login",
             "username": self.auth.username,
             "password": self.auth.password
         }
-        logger.info("Logging in...")
+        logger.info("Logging in to Qualys API...")
         resp = self.session.post(url, headers=self.fo_headers, data=data, verify=self.cert_path)
-        resp.raise_for_status()
-        if "QualysSession" not in self.session.cookies:
-            raise Exception("Login failed.")
+        try:
+            resp.raise_for_status()
+        except Exception:
+            logger.error(f"Login HTTP error: status {resp.status_code}, body: {resp.text}")
+            raise
+        # Confirm session cookie present
+        if "QualysSession" not in self.session.cookies.get_dict():
+            raise Exception("Login failed: QualysSession cookie not found.")
         logger.info("Login successful.")
 
     def logout(self):
-        """Logout from Qualys API"""
+        """Logout from Qualys API."""
         url = f"{self.base_url}/api/2.0/fo/session/"
         data = {"action": "logout"}
         try:
             self.session.post(url, headers=self.fo_headers, data=data, verify=self.cert_path)
         except Exception:
             pass
-        logger.info("Logged out.")
+        logger.info("Logged out from Qualys API.")
 
-    def get_qid_from_cve(self, cve_id):
+    def get_host_list_detection(self, cve_ids, max_days_since_detection=365):
         """
-        Get Qualys QID(s) associated with a CVE
-        Uses the Knowledge Base API to map CVE to QID
-        """
-        url = f"{self.base_url}/api/2.0/fo/knowledge_base/vuln/"
-        params = {
-            "action": "list",
-            "details": "All",
-            "cve_id": cve_id
-        }
-        
-        logger.info(f"Looking up QID for CVE: {cve_id}")
-        resp = self.session.get(url, headers=self.fo_headers, params=params, verify=self.cert_path)
-        resp.raise_for_status()
-        
-        try:
-            root = ET.fromstring(resp.content)
-        except ET.ParseError:
-            raise Exception("Malformed XML response from Knowledge Base API.")
-        
-        qids = []
-        vulns = root.findall(".//VULN")
-        
-        for vuln in vulns:
-            qid = vuln.findtext("QID")
-            title = vuln.findtext("TITLE", "")
-            severity = vuln.findtext("SEVERITY_LEVEL", "")
-            
-            if qid:
-                qids.append({
-                    "qid": qid,
-                    "title": title,
-                    "severity": severity,
-                    "cve": cve_id
-                })
-        
-        if not qids:
-            logger.warning(f"No QIDs found for CVE: {cve_id}")
-        else:
-            logger.info(f"Found {len(qids)} QID(s) for CVE {cve_id}: {[q['qid'] for q in qids]}")
-        
-        return qids
-
-    def build_vuln_detection_request(self, qids, offset):
-        """
-        Build XML request for vulnerability detection search using QIDs
-        Uses the hostinstancevuln endpoint
-        """
-        root = ET.Element("ServiceRequest")
-        filters = ET.SubElement(root, "filters")
-        
-        # Create QID filter - can search multiple QIDs at once
-        if len(qids) == 1:
-            ET.SubElement(filters, "Criteria", field="qid", operator="EQUALS").text = str(qids[0])
-        else:
-            qid_list = ",".join([str(qid) for qid in qids])
-            ET.SubElement(filters, "Criteria", field="qid", operator="IN").text = qid_list
-        
-        # Only show active vulnerabilities (not fixed)
-        ET.SubElement(filters, "Criteria", field="status", operator="EQUALS").text = "Active"
-        
-        prefs = ET.SubElement(root, "preferences")
-        ET.SubElement(prefs, "startFromOffset").text = str(offset)
-        ET.SubElement(prefs, "limitResults").text = str(self.page_size)
-        
-        # Request specific fields we need
-        fields = ET.SubElement(root, "fields")
-        
-        # Host instance vulnerability fields
-        host_vuln = ET.SubElement(fields, "HostInstanceVuln")
-        ET.SubElement(host_vuln, "hostInstanceId")
-        ET.SubElement(host_vuln, "cveId")
-        ET.SubElement(host_vuln, "qid")
-        ET.SubElement(host_vuln, "status")
-        ET.SubElement(host_vuln, "severity")
-        ET.SubElement(host_vuln, "firstFound")
-        ET.SubElement(host_vuln, "lastFound")
-        ET.SubElement(host_vuln, "port")
-        ET.SubElement(host_vuln, "protocol")
-        ET.SubElement(host_vuln, "results")
-        
-        # Host asset information
-        host_asset = ET.SubElement(host_vuln, "hostAsset")
-        ET.SubElement(host_asset, "id")
-        ET.SubElement(host_asset, "dnsHostName")
-        ET.SubElement(host_asset, "netbiosName")
-        ET.SubElement(host_asset, "operatingSystem")
-        ET.SubElement(host_asset, "lastVulnScan")
-        
-        return ET.tostring(root, encoding="utf-8")
-
-    def search_vulnerable_hosts(self, qids):
-        """
-        Search for hosts with specific QID vulnerabilities
-        Uses the hostinstancevuln endpoint for QID search
-        """
-        if not qids:
-            return []
-            
-        url = f"{self.base_url}/qps/rest/2.0/search/am/hostinstancevuln"
-        offset, page = 1, 1
-        results = []
-
-        while True:
-            logger.info(f"Fetching vulnerable hosts page {page}, offset {offset}...")
-            body = self.build_vuln_detection_request(qids, offset)
-            
-            # Debug: Log the request
-            logger.debug(f"Request URL: {url}")
-            logger.debug(f"Request body: {body.decode('utf-8')}")
-            
-            resp = self.session.post(url, headers=self.qps_headers, auth=self.auth, data=body, verify=self.cert_path)
-            
-            if resp.status_code == 400:
-                logger.error(f"Bad Request (400). Response: {resp.text}")
-                raise Exception(f"Bad Request: {resp.text}")
-            elif resp.status_code == 403:
-                raise Exception("Forbidden. Check access/credentials for vulnerability detection API.")
-            
-            resp.raise_for_status()
-
-            try:
-                root = ET.fromstring(resp.content)
-            except ET.ParseError:
-                logger.error(f"XML Parse Error. Response content: {resp.content}")
-                raise Exception("Malformed XML response from vulnerability search.")
-
-            # Look for HostInstanceVuln elements
-            vulns = root.findall(".//HostInstanceVuln")
-            if not vulns:
-                logger.info("No more vulnerability records found.")
-                break
-
-            results.extend(vulns)
-            has_more = root.findtext(".//hasMoreRecords") == "true"
-            if not has_more:
-                break
-            offset += self.page_size
-            page += 1
-
-        return results
-
-    def extract_vulnerability_details(self, vuln_instances):
-        """
-        Extract vulnerability details from HostInstanceVuln elements
-        Returns structured data about each vulnerable host
-        """
-        results = []
-        
-        for vuln in vuln_instances:
-            # Extract vulnerability instance details
-            host_instance_id = vuln.findtext("hostInstanceId", "")
-            cve_id = vuln.findtext("cveId", "")
-            qid = vuln.findtext("qid", "")
-            status = vuln.findtext("status", "")
-            severity = vuln.findtext("severity", "")
-            first_found = vuln.findtext("firstFound", "")
-            last_found = vuln.findtext("lastFound", "")
-            port = vuln.findtext("port", "")
-            protocol = vuln.findtext("protocol", "")
-            results_text = vuln.findtext("results", "")
-            
-            # Extract host asset details
-            host_asset = vuln.find("hostAsset")
-            if host_asset is not None:
-                host_id = host_asset.findtext("id", "")
-                dns = host_asset.findtext("dnsHostName", "")
-                netbios = host_asset.findtext("netbiosName", "")
-                os_info = host_asset.findtext("operatingSystem", "")
-                last_scan = host_asset.findtext("lastVulnScan", "")
-            else:
-                host_id = dns = netbios = os_info = last_scan = ""
-            
-            results.append({
-                "Host ID": host_id,
-                "Host Instance ID": host_instance_id,
-                "DNS Name": dns,
-                "NetBIOS Name": netbios,
-                "Operating System": os_info,
-                "CVE": cve_id,
-                "QID": qid,
-                "Severity": severity,
-                "Status": status,
-                "Port": port,
-                "Protocol": protocol,
-                "First Found": first_found,
-                "Last Found": last_found,
-                "Last Vulnerability Scan": last_scan,
-                "Detection Results": results_text[:500] + "..." if len(results_text) > 500 else results_text
-            })
-        
-        return results
-
-    def get_host_list_detection(self, cve_ids):
-        """
-        Alternative method using Host List Detection API
-        More direct for vulnerability-specific searches
+        Use FO Host List Detection API to search hosts vulnerable to given CVEs.
+        Returns a list of dicts with host + detection details.
         """
         url = f"{self.base_url}/api/2.0/fo/asset/host/vm/detection/"
-        
         all_results = []
-        
+
         for cve_id in cve_ids:
             logger.info(f"Searching for hosts vulnerable to {cve_id}...")
-            
             params = {
                 "action": "list",
                 "cve_id": cve_id,
-                "status": "Active",  # Only active vulnerabilities
-                "show_results": "1",  # Include detection results
-                "show_igs": "1",      # Include ignored/disabled status
-                "max_days_since_detection": "365"  # Limit to detections in last year
+                "status": "Active",         # Only active vulnerabilities
+                "show_results": "1",        # Include detection results
+                "show_igs": "1",            # Include ignored/disabled status if present
+                "max_days_since_detection": str(max_days_since_detection)
             }
-            
             try:
                 resp = self.session.get(url, headers=self.fo_headers, params=params, verify=self.cert_path)
                 resp.raise_for_status()
-                
-                root = ET.fromstring(resp.content)
-                detections = root.findall(".//DETECTION")
-                
-                logger.info(f"Found {len(detections)} vulnerable hosts for {cve_id}")
-                
-                for detection in detections:
-                    host_info = {
-                        "CVE": cve_id,
-                        "Host ID": detection.findtext("../IP", ""),  # Parent HOST element
-                        "IP Address": detection.findtext("../IP", ""),
-                        "DNS Name": detection.findtext("../DNS", ""),
-                        "NetBIOS Name": detection.findtext("../NETBIOS", ""),
-                        "Operating System": detection.findtext("../OS", ""),
-                        "QID": detection.findtext("QID", ""),
-                        "Vulnerability Title": detection.findtext("TITLE", ""),
-                        "Severity": detection.findtext("SEVERITY", ""),
-                        "Port": detection.findtext("PORT", ""),
-                        "Protocol": detection.findtext("PROTOCOL", ""),
-                        "First Found": detection.findtext("FIRST_FOUND_DATETIME", ""),
-                        "Last Found": detection.findtext("LAST_FOUND_DATETIME", ""),
-                        "Status": detection.findtext("STATUS", ""),
-                        "Detection Results": detection.findtext("RESULTS", "")[:500] + "..." if detection.findtext("RESULTS", "") and len(detection.findtext("RESULTS", "")) > 500 else detection.findtext("RESULTS", "")
-                    }
-                    all_results.append(host_info)
-                    
             except Exception as e:
-                logger.error(f"Error searching for CVE {cve_id}: {str(e)}")
+                logger.error(f"Error fetching detections for {cve_id}: {str(e)}; response: {getattr(e, 'response', None)}")
                 continue
-        
+
+            # Parse XML
+            try:
+                root = ET.fromstring(resp.content)
+            except ET.ParseError:
+                logger.error(f"Failed to parse XML for CVE {cve_id}. Raw response:\n{resp.text}")
+                continue
+
+            # The typical structure:
+            # <HOST_LIST>
+            #   <HOST>
+            #     <ID>...</ID>
+            #     <IP>...</IP>
+            #     <DNS>...</DNS>
+            #     <NETBIOS>...</NETBIOS>
+            #     <OS>...</OS>
+            #     <VULN_DETECTION_LIST>
+            #       <DETECTION> ... </DETECTION>
+            #       ...
+            #     </VULN_DETECTION_LIST>
+            #   </HOST>
+            #   ...
+            # </HOST_LIST>
+            #
+            # But the exact tag names can vary; we search generically for HOST elements.
+            hosts = root.findall(".//HOST")
+            logger.info(f"Found {len(hosts)} HOST entries in response for {cve_id}")
+
+            for host in hosts:
+                host_ip = host.findtext("IP", "")
+                host_dns = host.findtext("DNS", "")
+                host_netbios = host.findtext("NETBIOS", "")
+                host_os = host.findtext("OS", "")
+                host_id = host.findtext("ID", "")  # sometimes HOST ID may be under <ID>
+
+                # Search DETECTION elements under this HOST
+                detections = host.findall(".//DETECTION")
+                if not detections:
+                    # In some responses, detection may be nested differently or absent
+                    logger.debug(f"No DETECTION found under HOST {host_ip} for CVE {cve_id}")
+                    continue
+
+                for det in detections:
+                    # Extract fields from DETECTION element
+                    det_qid = det.findtext("QID", "")
+                    det_title = det.findtext("TITLE", "")
+                    det_severity = det.findtext("SEVERITY", "")
+                    det_port = det.findtext("PORT", "")
+                    det_protocol = det.findtext("PROTOCOL", "")
+                    det_first = det.findtext("FIRST_FOUND_DATETIME", "") or det.findtext("FIRST_FOUND", "")
+                    det_last = det.findtext("LAST_FOUND_DATETIME", "") or det.findtext("LAST_FOUND", "")
+                    det_status = det.findtext("STATUS", "")
+                    det_results = det.findtext("RESULTS", "") or ""
+                    # Truncate long results text for summary columns
+                    det_results_summary = det_results[:500] + "..." if len(det_results) > 500 else det_results
+
+                    entry = {
+                        "CVE": cve_id,
+                        "Host ID": host_id,
+                        "IP Address": host_ip,
+                        "DNS Name": host_dns,
+                        "NetBIOS Name": host_netbios,
+                        "Operating System": host_os,
+                        "QID": det_qid,
+                        "Vulnerability Title": det_title,
+                        "Severity": det_severity,
+                        "Port": det_port,
+                        "Protocol": det_protocol,
+                        "First Found": det_first,
+                        "Last Found": det_last,
+                        "Status": det_status,
+                        "Detection Results": det_results_summary
+                    }
+                    all_results.append(entry)
+
+            logger.info(f"Total vulnerable host entries collected for {cve_id}: {len(all_results)}")
+
         return all_results
 
     def send_email(self, filename, cve_ids, vulnerable_count, total_detections):
-        """Send email notification about vulnerable hosts"""
+        """
+        Draft an Outlook email with the report attached if vulnerabilities found.
+        Opens the draft for review/send.
+        """
         if vulnerable_count > 0:
-            outlook = win32.Dispatch("Outlook.Application")
-            mail = outlook.CreateItem(0)
-            
-            cve_list = ", ".join(cve_ids)
-            mail.Subject = f"[VULNERABILITY ALERT] {vulnerable_count} Vulnerable Hosts - CVE: {cve_list}"
-            
-            mail.Body = f"""
+            try:
+                outlook = win32.Dispatch("Outlook.Application")
+            except Exception as e:
+                logger.error(f"Failed to dispatch Outlook.Application: {e}")
+                return
+
+            mail = outlook.CreateItem(0)  # 0=MailItem
+            cve_list_str = ", ".join(cve_ids)
+            mail.Subject = f"[VULNERABILITY ALERT] {vulnerable_count} Vulnerable Hosts - CVE(s): {cve_list_str}"
+            body = f"""
 Hello,
 
-Vulnerability scan results for CVE(s): {cve_list}
+Vulnerability scan results for CVE(s): {cve_list_str}
 
 Summary:
 - Total vulnerable hosts found: {vulnerable_count}
-- Total vulnerability detections: {total_detections}
+- Total vulnerability instances: {total_detections}
 
 Please find attached the detailed vulnerability report.
 
@@ -343,92 +209,86 @@ Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 Regards,
 Vulnerability Management System
-            """.strip()
-            
-            mail.Attachments.Add(os.path.abspath(filename))
-            mail.Display()  # Opens the draft
-            logger.info(f"Email draft created for {vulnerable_count} vulnerable hosts")
+""".strip()
+            mail.Body = body
+            try:
+                abs_path = os.path.abspath(filename)
+                mail.Attachments.Add(abs_path)
+            except Exception as e:
+                logger.error(f"Failed to attach file {filename}: {e}")
+            # Display draft for user to review/send
+            mail.Display()
+            logger.info(f"Email draft created for {vulnerable_count} vulnerable hosts.")
         else:
-            logger.info("No vulnerable hosts found - email not created.")
+            logger.info("No vulnerable hosts found - no email drafted.")
 
     def run_cve_search(self, cve_ids):
         """
-        Main method to search for vulnerable hosts by CVE
-        First converts CVEs to QIDs, then uses QIDs for search
-        
-        Args:
-            cve_ids: List of CVE identifiers (e.g., ['CVE-2024-1234', 'CVE-2024-5678'])
+        Main method: login, search hosts by CVE, generate Excel report, draft email if needed, logout.
         """
+        if not cve_ids:
+            logger.error("No CVE IDs provided to run_cve_search.")
+            return
+
+        # Login
         self.login()
         try:
-            logger.info(f"Searching for vulnerabilities using CVE(s): {', '.join(cve_ids)}")
-            
-            # Step 1: Convert CVEs to QIDs
-            all_qids = []
-            cve_to_qid_mapping = {}
-            
-            for cve_id in cve_ids:
-                qid_info = self.get_qid_from_cve(cve_id)
-                if qid_info:
-                    qids_for_cve = [info['qid'] for info in qid_info]
-                    all_qids.extend(qids_for_cve)
-                    cve_to_qid_mapping[cve_id] = qids_for_cve
-                else:
-                    logger.warning(f"No QIDs found for CVE {cve_id}")
-            
-            if not all_qids:
-                logger.error("No QIDs found for any of the provided CVEs")
-                return
-            
-            logger.info(f"Found QIDs: {all_qids}")
-            
-            # Step 2: Search using QIDs
-            vuln_instances = self.search_vulnerable_hosts(all_qids)
-            logger.info(f"Found {len(vuln_instances)} vulnerability instances")
-            
-            if not vuln_instances:
-                logger.info("No vulnerable hosts found for the specified CVE(s).")
-                # Create empty Excel file for tracking
-                df_empty = pd.DataFrame(columns=[
-                    "CVE", "Host ID", "Host Instance ID", "DNS Name", "NetBIOS Name", 
-                    "Operating System", "QID", "Severity", "Port", "Protocol", 
-                    "First Found", "Last Found", "Status", "Last Vulnerability Scan",
+            # Directly fetch host detections by CVE
+            results_list = self.get_host_list_detection(cve_ids)
+            if not results_list:
+                logger.info("No vulnerable hosts found for the specified CVE(s). Creating an empty report.")
+                # Create empty DataFrame with expected columns
+                columns = [
+                    "CVE", "Host ID", "IP Address", "DNS Name", "NetBIOS Name",
+                    "Operating System", "QID", "Vulnerability Title", "Severity",
+                    "Port", "Protocol", "First Found", "Last Found", "Status",
                     "Detection Results"
-                ])
-                filename = f"CVE_Vulnerability_Report_{'_'.join([c.replace('CVE-', '') for c in cve_ids])}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                ]
+                df_empty = pd.DataFrame(columns=columns)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"CVE_Vulnerability_Report_{'_'.join([c.replace('CVE-', '') for c in cve_ids])}_{timestamp}.xlsx"
                 df_empty.to_excel(filename, index=False)
                 logger.info(f"Empty Excel file created: {filename}")
+                # No email since no vulnerabilities
                 return
 
-            # Extract vulnerability details
-            results = self.extract_vulnerability_details(vuln_instances)
-            
-            # Create DataFrame and sort by severity
-            df = pd.DataFrame(results)
-            
-            # Sort by severity (5=Critical, 4=High, 3=Medium, 2=Low, 1=Info) then by Host ID
-            severity_order = ["5", "4", "3", "2", "1"]  # Qualys severity levels
-            if "Severity" in df.columns:
-                df["Severity_Sort"] = pd.Categorical(df["Severity"], categories=severity_order, ordered=True)
-                df = df.sort_values(by=["Severity_Sort", "Host ID", "CVE"])
-                df = df.drop("Severity_Sort", axis=1)
+            # Build DataFrame
+            df = pd.DataFrame(results_list)
 
-            # Generate filename with timestamp
-            filename = f"CVE_Vulnerability_Report_{'_'.join([c.replace('CVE-', '') for c in cve_ids])}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            
-            # Save to Excel with formatting
+            # Sort by severity if present: Qualys returns severity numeric as string "5","4",...
+            if "Severity" in df.columns:
+                # Define ordering: Critical=5, High=4, etc.
+                severity_order = ["5", "4", "3", "2", "1"]
+                df["Severity_Sort"] = pd.Categorical(df["Severity"], categories=severity_order, ordered=True)
+                # Sort by Severity, then Host ID, then CVE
+                sort_cols = ["Severity_Sort"]
+                if "Host ID" in df.columns:
+                    sort_cols.append("Host ID")
+                if "CVE" in df.columns:
+                    sort_cols.append("CVE")
+                df = df.sort_values(by=sort_cols)
+                df = df.drop(columns=["Severity_Sort"], errors='ignore')
+
+            # Generate filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"CVE_Vulnerability_Report_{'_'.join([c.replace('CVE-', '') for c in cve_ids])}_{timestamp}.xlsx"
+
+            # Save to Excel with multiple sheets: Details and Summary
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                # Details sheet
                 df.to_excel(writer, sheet_name='Vulnerability Details', index=False)
-                
-                # Create summary sheet
+
+                # Summary sheet
+                unique_hosts = df["Host ID"].nunique() if "Host ID" in df.columns else 0
+                total_instances = len(df)
+                # Count by severity
                 summary_data = {
                     "Metric": [
                         "Total CVEs Searched",
-                        "Total QIDs Found",
-                        "Total Vulnerable Hosts",
                         "Total Vulnerability Instances",
+                        "Total Vulnerable Hosts",
                         "Critical Severity (5)",
-                        "High Severity (4)", 
+                        "High Severity (4)",
                         "Medium Severity (3)",
                         "Low Severity (2)",
                         "Info Severity (1)",
@@ -436,42 +296,61 @@ Vulnerability Management System
                     ],
                     "Value": [
                         len(cve_ids),
-                        len(all_qids),
-                        len(df["Host ID"].unique()) if not df.empty else 0,
-                        len(df),
-                        len(df[df["Severity"] == "5"]) if not df.empty else 0,
-                        len(df[df["Severity"] == "4"]) if not df.empty else 0,
-                        len(df[df["Severity"] == "3"]) if not df.empty else 0,
-                        len(df[df["Severity"] == "2"]) if not df.empty else 0,
-                        len(df[df["Severity"] == "1"]) if not df.empty else 0,
+                        total_instances,
+                        unique_hosts,
+                        int(df[df["Severity"] == "5"].shape[0]) if "Severity" in df.columns else 0,
+                        int(df[df["Severity"] == "4"].shape[0]) if "Severity" in df.columns else 0,
+                        int(df[df["Severity"] == "3"].shape[0]) if "Severity" in df.columns else 0,
+                        int(df[df["Severity"] == "2"].shape[0]) if "Severity" in df.columns else 0,
+                        int(df[df["Severity"] == "1"].shape[0]) if "Severity" in df.columns else 0,
                         datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     ]
                 }
                 summary_df = pd.DataFrame(summary_data)
                 summary_df.to_excel(writer, sheet_name='Summary', index=False)
-                
-                # Create CVE to QID mapping sheet
-                mapping_data = []
-                for cve, qids in cve_to_qid_mapping.items():
-                    for qid in qids:
-                        mapping_data.append({"CVE": cve, "QID": qid})
-                mapping_df = pd.DataFrame(mapping_data)
-                mapping_df.to_excel(writer, sheet_name='CVE to QID Mapping', index=False)
 
-            vulnerable_hosts = len(df["Host ID"].unique()) if not df.empty else 0
-            total_instances = len(df)
-            
-            logger.info(f"Vulnerability Search Results:")
-            logger.info(f"    CVEs searched: {', '.join(cve_ids)}")
-            logger.info(f"    QIDs found: {len(all_qids)}")
-            logger.info(f"    Vulnerable hosts found: {vulnerable_hosts}")
-            logger.info(f"    Total vulnerability instances: {total_instances}")
-            if not df.empty:
-                logger.info(f"    Severity breakdown:")
-                for sev, label in [("5", "Critical"), ("4", "High"), ("3", "Medium"), ("2", "Low"), ("1", "Info")]:
-                    count = len(df[df["Severity"] == sev])
-                    if count > 0:
-                        logger.info(f"        {label}: {count}")
+                # CVE list sheet
+                cve_list_df = pd.DataFrame({"CVE": cve_ids})
+                cve_list_df.to_excel(writer, sheet_name='CVE List', index=False)
+
             logger.info(f"Saved Excel report: {filename}")
-            
-            # Send email n
+
+            # Draft email if vulnerabilities found
+            vulnerable_hosts_count = unique_hosts
+            self.send_email(filename, cve_ids, vulnerable_hosts_count, total_instances)
+
+        finally:
+            # Ensure logout even on error
+            try:
+                self.logout()
+            except Exception as e:
+                logger.warning(f"Error during logout: {e}")
+
+
+if __name__ == "__main__":
+    # Example usage:
+    # Read CVE IDs from command-line arguments or a JSON file, etc.
+    # For demonstration, we pick some CVEs:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Qualys CVE Vulnerability Searcher")
+    parser.add_argument("--cves", nargs="+", required=True,
+                        help="List of CVE IDs to search, e.g. CVE-2024-1234 CVE-2024-5678")
+    parser.add_argument("--username", default=USERNAME, help="Qualys username")
+    parser.add_argument("--password", default=PASSWORD, help="Qualys password")
+    parser.add_argument("--cert", default=CERT_PATH, help="Path to corporate cert PEM or False")
+    parser.add_argument("--base-url", default=BASE_URL, help="Qualys API base URL")
+    args = parser.parse_args()
+
+    # Optionally override via env or args
+    searcher = QualysCVESearcher(
+        username=args.username,
+        password=args.password,
+        cert_path=(False if str(args.cert).lower() in ("false","none","") else args.cert),
+        base_url=args.base_url
+    )
+    try:
+        searcher.run_cve_search(args.cves)
+    except Exception as e:
+        logger.error(f"Exception during CVE search: {e}")
+        sys.exit(1)
