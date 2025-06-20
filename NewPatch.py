@@ -108,20 +108,20 @@ class QualysCVESearcher:
         
         return qids
 
-    def build_vuln_detection_request(self, cve_ids, offset):
+    def build_vuln_detection_request(self, qids, offset):
         """
-        Build XML request for vulnerability detection search using CVEs
+        Build XML request for vulnerability detection search using QIDs
         Uses the hostinstancevuln endpoint
         """
         root = ET.Element("ServiceRequest")
         filters = ET.SubElement(root, "filters")
         
-        # Create CVE filter - can search multiple CVEs at once
-        if len(cve_ids) == 1:
-            ET.SubElement(filters, "Criteria", field="cveId", operator="EQUALS").text = cve_ids[0]
+        # Create QID filter - can search multiple QIDs at once
+        if len(qids) == 1:
+            ET.SubElement(filters, "Criteria", field="qid", operator="EQUALS").text = str(qids[0])
         else:
-            cve_list = ",".join(cve_ids)
-            ET.SubElement(filters, "Criteria", field="cveId", operator="IN").text = cve_list
+            qid_list = ",".join([str(qid) for qid in qids])
+            ET.SubElement(filters, "Criteria", field="qid", operator="IN").text = qid_list
         
         # Only show active vulnerabilities (not fixed)
         ET.SubElement(filters, "Criteria", field="status", operator="EQUALS").text = "Active"
@@ -156,12 +156,12 @@ class QualysCVESearcher:
         
         return ET.tostring(root, encoding="utf-8")
 
-    def search_vulnerable_hosts(self, cve_ids):
+    def search_vulnerable_hosts(self, qids):
         """
-        Search for hosts with specific CVE vulnerabilities
-        Uses the hostinstancevuln endpoint for direct CVE search
+        Search for hosts with specific QID vulnerabilities
+        Uses the hostinstancevuln endpoint for QID search
         """
-        if not cve_ids:
+        if not qids:
             return []
             
         url = f"{self.base_url}/qps/rest/2.0/search/am/hostinstancevuln"
@@ -170,7 +170,7 @@ class QualysCVESearcher:
 
         while True:
             logger.info(f"Fetching vulnerable hosts page {page}, offset {offset}...")
-            body = self.build_vuln_detection_request(cve_ids, offset)
+            body = self.build_vuln_detection_request(qids, offset)
             
             # Debug: Log the request
             logger.debug(f"Request URL: {url}")
@@ -354,7 +354,7 @@ Vulnerability Management System
     def run_cve_search(self, cve_ids):
         """
         Main method to search for vulnerable hosts by CVE
-        Uses the hostinstancevuln endpoint for direct CVE search
+        First converts CVEs to QIDs, then uses QIDs for search
         
         Args:
             cve_ids: List of CVE identifiers (e.g., ['CVE-2024-1234', 'CVE-2024-5678'])
@@ -363,8 +363,27 @@ Vulnerability Management System
         try:
             logger.info(f"Searching for vulnerabilities using CVE(s): {', '.join(cve_ids)}")
             
-            # Direct CVE search using hostinstancevuln endpoint
-            vuln_instances = self.search_vulnerable_hosts(cve_ids)
+            # Step 1: Convert CVEs to QIDs
+            all_qids = []
+            cve_to_qid_mapping = {}
+            
+            for cve_id in cve_ids:
+                qid_info = self.get_qid_from_cve(cve_id)
+                if qid_info:
+                    qids_for_cve = [info['qid'] for info in qid_info]
+                    all_qids.extend(qids_for_cve)
+                    cve_to_qid_mapping[cve_id] = qids_for_cve
+                else:
+                    logger.warning(f"No QIDs found for CVE {cve_id}")
+            
+            if not all_qids:
+                logger.error("No QIDs found for any of the provided CVEs")
+                return
+            
+            logger.info(f"Found QIDs: {all_qids}")
+            
+            # Step 2: Search using QIDs
+            vuln_instances = self.search_vulnerable_hosts(all_qids)
             logger.info(f"Found {len(vuln_instances)} vulnerability instances")
             
             if not vuln_instances:
@@ -405,6 +424,7 @@ Vulnerability Management System
                 summary_data = {
                     "Metric": [
                         "Total CVEs Searched",
+                        "Total QIDs Found",
                         "Total Vulnerable Hosts",
                         "Total Vulnerability Instances",
                         "Critical Severity (5)",
@@ -416,6 +436,7 @@ Vulnerability Management System
                     ],
                     "Value": [
                         len(cve_ids),
+                        len(all_qids),
                         len(df["Host ID"].unique()) if not df.empty else 0,
                         len(df),
                         len(df[df["Severity"] == "5"]) if not df.empty else 0,
@@ -428,12 +449,21 @@ Vulnerability Management System
                 }
                 summary_df = pd.DataFrame(summary_data)
                 summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Create CVE to QID mapping sheet
+                mapping_data = []
+                for cve, qids in cve_to_qid_mapping.items():
+                    for qid in qids:
+                        mapping_data.append({"CVE": cve, "QID": qid})
+                mapping_df = pd.DataFrame(mapping_data)
+                mapping_df.to_excel(writer, sheet_name='CVE to QID Mapping', index=False)
 
             vulnerable_hosts = len(df["Host ID"].unique()) if not df.empty else 0
             total_instances = len(df)
             
             logger.info(f"Vulnerability Search Results:")
             logger.info(f"    CVEs searched: {', '.join(cve_ids)}")
+            logger.info(f"    QIDs found: {len(all_qids)}")
             logger.info(f"    Vulnerable hosts found: {vulnerable_hosts}")
             logger.info(f"    Total vulnerability instances: {total_instances}")
             if not df.empty:
@@ -444,39 +474,4 @@ Vulnerability Management System
                         logger.info(f"        {label}: {count}")
             logger.info(f"Saved Excel report: {filename}")
             
-            # Send email notification
-            self.send_email(filename, cve_ids, vulnerable_hosts, total_instances)
-            
-        finally:
-            self.logout()
-
-
-def main():
-    print("=== Qualys CVE-Based Vulnerability Scanner ===")
-    print("Direct CVE to vulnerable hosts lookup")
-    print("Enter CVE ID(s) to search for vulnerable systems\n")
-    
-    cve_input = input("Enter CVE ID(s) separated by commas: ").strip()
-    if not cve_input:
-        print("No CVE IDs provided.")
-        sys.exit(1)
-
-    # Parse and validate CVE IDs
-    cve_ids = [cve.strip().upper() for cve in cve_input.split(",") if cve.strip()]
-    valid_cves = []
-    
-    for cve in cve_ids:
-        if cve.startswith("CVE-") and len(cve.split("-")) == 3:
-            try:
-                # Validate year and number parts
-                parts = cve.split("-")
-                year = int(parts[1])
-                number = int(parts[2])
-                if year >= 1999 and number >= 0:  # CVE program started in 1999
-                    valid_cves.append(cve)
-                else:
-                    print(f"Warning: '{cve}' has invalid year or number")
-            except ValueError:
-                print(f"Warning: '{cve}' is not a valid CVE format")
-        else:
-            print(f
+            # Send email n
