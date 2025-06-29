@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import sys
+import win32com.client as win32  # 👈 For email
 
 from cve import (
     fetch_recent_cves,
@@ -29,6 +30,35 @@ q_logger.setLevel(logging.WARNING)
 
 def sanitize_filename(s: str) -> str:
     return re.sub(r"[^\w\-_.]", "_", s)
+
+def send_email_custom(filename, software_name, max_versions, cve_ids=None, cve_summaries=None):
+    outlook = win32.Dispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)
+
+    joined_max = "/".join(max_versions)
+    mail.Subject = f"[PATCH ALERT] Devices with {software_name} (max: {joined_max})"
+
+    summary_block = ""
+    if cve_ids and cve_summaries and len(cve_ids) == len(cve_summaries):
+        lines = [f"- {cid}: {summ}" for cid, summ in zip(cve_ids, cve_summaries)]
+        summary_block = "\nCVE Summaries:\n" + "\n".join(lines)
+
+    mail.Body = f"""
+Hello,
+
+Please find attached the list of devices where '{software_name}' is installed, evaluated against specified version(s) '{joined_max}'.
+
+{summary_block}
+
+Take appropriate patching action.
+
+Regards,  
+Patch Automation System
+""".strip()
+
+    mail.Attachments.Add(os.path.abspath(filename))
+    mail.Display()
+
 
 def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
     logger.info("Starting integrated CVE→Qualys workflow (last %d days)...", days_back)
@@ -81,20 +111,21 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
             logger.info("  Running Qualys for versions: %s", versions)
             qs.run(product, versions)
 
-            # ✅ Save as Assets_<software>_<timestamp>.xlsx
+            # 🔐 Fixed filename: no versions used, safe naming
             excel_name = os.path.join(
                 OUTPUT_FOLDER,
                 f"Assets_{sanitize_filename(product)}_{ts}.xlsx"
             )
 
-            # ✅ Send email with that Excel file
-            qs.send_email(
+            # ✅ Use our custom email function here
+            send_email_custom(
                 filename=excel_name,
                 software_name=product,
                 max_versions=versions,
                 cve_ids=cve_ids,
                 cve_summaries=cve_summaries
             )
+
         except Exception as e:
             logger.error("  Error during Qualys run or email for %s: %s", product, e)
 
