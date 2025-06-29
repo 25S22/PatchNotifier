@@ -17,12 +17,11 @@ from qualys import QualysSearcher, USERNAME as QUALYS_USERNAME, PASSWORD as QUAL
 DAYS_BACK         = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 QUALYS_PAGE_SIZE  = 1000
 RATE_LIMIT_DELAY  = 6      # seconds between app scans
-AUDIT_LOG_FOLDER  = "audit_logs"   # used *only* locally in this script
+AUDIT_LOG_FOLDER  = "audit_logs"
 
 # === LOGGER SETUP ===
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("integrate")
-# prevent double logs
 q_logger = logging.getLogger("QualysFilteredSearch")
 q_logger.propagate = False
 q_logger.setLevel(logging.WARNING)
@@ -30,7 +29,7 @@ q_logger.setLevel(logging.WARNING)
 def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
     logger.info("Starting integrated CVE→Qualys workflow (last %d days)...", days_back)
 
-    ensure_audit_folder_exists()  # ← we use the default folder name; no arg passed
+    ensure_audit_folder_exists()
 
     applications = load_applications()
 
@@ -53,7 +52,7 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
         combined = matched + clubbed
         logger.info("  Found %d CVEs for %s", len(combined), product)
 
-        # 2) save audit log using default folder
+        # 2) save audit log
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", product.lower())
         log_path = os.path.join(AUDIT_LOG_FOLDER, f"{safe_name}_cve_{ts}.json")
@@ -63,15 +62,25 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
         # 3) extract versions and CVEs
         cve_ids       = [c["cve_id"]  for c in combined]
         cve_summaries = [c["summary"] for c in combined]
-        versions      = sorted({c["version"] for c in combined if c.get("version") and c["version"] != "Unknown"})
+
+        versions = sorted({
+            v.strip()
+            for c in combined
+            if c.get("version") and c["version"] != "Unknown"
+            for v in c["version"].split("/")
+            if v.strip()
+        })
 
         if not versions:
             logger.info("  No valid versions for %s; skipping Qualys.", product)
         else:
-            logger.info("  Running Qualys for versions: %s", versions)
+            # sanitize input to avoid Excel path errors
+            safe_versions = [v.replace("/", "_") for v in versions]
+            safe_product  = re.sub(r"[^\w\-_. ]", "_", product)
+
+            logger.info("  Running Qualys for versions: %s", safe_versions)
             try:
-                # This already handles email and Excel inside `qualys.py`
-                qs.run(product, versions)
+                qs.run(safe_product, safe_versions)
             except Exception as e:
                 logger.error("  Qualys run error for %s: %s", product, e)
 
