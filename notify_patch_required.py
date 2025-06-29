@@ -5,22 +5,35 @@ import time
 import logging
 import sys
 
-from cve import fetch_recent_cves, ensure_audit_folder_exists, load_applications, save_audit_log
+from cve import (
+    fetch_recent_cves,
+    ensure_audit_folder_exists,
+    load_applications,
+    save_audit_log
+)
 from qualys import QualysSearcher, USERNAME as QUALYS_USERNAME, PASSWORD as QUALYS_PASSWORD, CERT_PATH as QUALYS_CERT_PATH
 
 # === CONFIGURATION ===
-DAYS_BACK = int(sys.argv[1]) if len(sys.argv) > 1 else 7
-QUALYS_PAGE_SIZE = 1000
-RATE_LIMIT_DELAY = 6  # seconds between app scans
+DAYS_BACK         = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+QUALYS_PAGE_SIZE  = 1000
+RATE_LIMIT_DELAY  = 6      # seconds between app scans
+AUDIT_LOG_FOLDER  = "audit_logs"   # ← NEW
 
 # === LOGGER SETUP ===
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-logger = logging.getLogger()
+logger = logging.getLogger("integrate")  # root for this script
+# Prevent double‐logging from the QualysSearcher logger:
+q_logger = logging.getLogger("QualysFilteredSearch")
+q_logger.propagate = False        # ← CHANGED
+q_logger.setLevel(logging.WARNING)
 
 def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
     logger.info("Starting integrated CVE→Qualys workflow (last %d days)...", days_back)
 
+    ensure_audit_folder_exists(AUDIT_LOG_FOLDER)   # ← ensure folder is created once
     applications = load_applications()
+
+    # instantiate once
     qs = QualysSearcher(
         username=QUALYS_USERNAME,
         password=QUALYS_PASSWORD,
@@ -28,54 +41,61 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
         page_size=QUALYS_PAGE_SIZE
     )
 
-    for i, app in enumerate(applications, 1):
+    for idx, app in enumerate(applications, start=1):
         product = app.get("product")
         if not product:
             continue
-        logger.info("[%d/%d] Scanning CVEs for %s", i, len(applications), product)
 
-        # Fetch & club CVEs
+        logger.info("[%d/%d] Processing %s", idx, len(applications), product)
+
+        # 1) fetch CVEs
         matched, clubbed = fetch_recent_cves(product, days_back=days_back)
         combined = matched + clubbed
         logger.info("  Found %d CVEs for %s", len(combined), product)
 
-        # Save audit log
-        ensure_audit_folder_exists()
+        # 2) write audit log
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', product.lower())
-        log_path = os.path.join(AUDIT_LOG_FOLDER, f"{sanitized}_cve_{ts}.json")
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", product.lower())
+        log_path = os.path.join(AUDIT_LOG_FOLDER, f"{safe_name}_cve_{ts}.json")
         save_audit_log(combined, custom_path=log_path)
+        logger.info("  Audit log saved → %s", log_path)
 
-        # Prepare lists
-        cve_ids       = [e['cve_id']  for e in combined]
-        cve_summaries = [e['summary'] for e in combined]
-        versions      = list({e['version'] for e in combined if e['version'] and e['version'] != 'Unknown'})
+        # 3) prepare version list and CVE fields
+        cve_ids       = [c["cve_id"]  for c in combined]
+        cve_summaries = [c["summary"] for c in combined]
+        versions      = sorted({c["version"] for c in combined if c.get("version") and c["version"] != "Unknown"})
 
-        # Run Qualys search
-        if versions:
-            logger.info("  Running Qualys for versions: %s", versions)
-            try:
-                qs.run(product, versions)
-            except Exception as e:
-                logger.error("  Qualys run error for %s %s: %s", product, versions, e)
+        if not versions:
+            logger.info("  No valid versions for %s; skipping Qualys.", product)
         else:
-            logger.info("  Skipping Qualys for %s: No valid versions", product)
+            logger.info("  Running Qualys search for versions: %s", versions)
 
-        # Collect & email (with summaries)
-        try:
-            filename, vuln_count, det_count = qs.collect_results()
+            # ← RUN but *do not* let run() send its own email:
+            qs.run(product, versions, send_email=False)  
+
+            # ← collect the filename and status counts out of the QS instance:
+            filename, counts = qs.collect_results()  
+            total   = counts.get("total",    0)
+            below   = counts.get("below",    0)
+            upto    = counts.get("upto",     0)
+            notfound= counts.get("notfound", 0)
+
+            # 4) now send one consolidated email, with CVE details and counts:
             qs.send_email(
                 filename=filename,
                 software_name=product,
                 max_versions=versions,
                 cve_ids=cve_ids,
-                cve_summaries=cve_summaries
+                cve_summaries=cve_summaries,
+                total=total,
+                below=below,
+                upto=upto,
+                notfound=notfound
             )
-        except AttributeError:
-            logger.warning("QualysSearcher.collect_results/send_email signature may need updating.")
 
-        if i < len(applications):
-            logger.info("Sleeping %ds to respect rate limits...", RATE_LIMIT_DELAY)
+        # rate‐limit between applications
+        if idx < len(applications):
+            logger.info("Sleeping %d seconds to respect rate limits...", RATE_LIMIT_DELAY)
             time.sleep(RATE_LIMIT_DELAY)
 
     logger.info("Integration complete.")
