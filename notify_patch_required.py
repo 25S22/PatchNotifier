@@ -81,13 +81,13 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
             logger.info("  Running Qualys for versions: %s", versions)
             qs.run(product, versions)
 
-            # Safe Excel name (no versions!)
+            # ✅ Save as Assets_<software>_<timestamp>.xlsx
             excel_name = os.path.join(
                 OUTPUT_FOLDER,
-                f"{sanitize_filename(product)}_{ts}.xlsx"
+                f"Assets_{sanitize_filename(product)}_{ts}.xlsx"
             )
 
-            # Send email with proper summary
+            # ✅ Send email with that Excel file
             qs.send_email(
                 filename=excel_name,
                 software_name=product,
