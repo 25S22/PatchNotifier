@@ -63,24 +63,19 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
         cve_ids       = [c["cve_id"]  for c in combined]
         cve_summaries = [c["summary"] for c in combined]
 
+        # ⛔ Do NOT split multi-versions — pass exactly what was returned
         versions = sorted({
-            v.strip()
+            c["version"].strip()
             for c in combined
             if c.get("version") and c["version"] != "Unknown"
-            for v in c["version"].split("/")
-            if v.strip()
         })
 
         if not versions:
             logger.info("  No valid versions for %s; skipping Qualys.", product)
         else:
-            # sanitize input to avoid Excel path errors
-            safe_versions = [v.replace("/", "_") for v in versions]
-            safe_product  = re.sub(r"[^\w\-_. ]", "_", product)
-
-            logger.info("  Running Qualys for versions: %s", safe_versions)
+            logger.info("  Running Qualys for versions: %s", versions)
             try:
-                qs.run(safe_product, safe_versions)
+                qs.run(product, versions)
             except Exception as e:
                 logger.error("  Qualys run error for %s: %s", product, e)
 
