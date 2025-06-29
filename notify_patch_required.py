@@ -18,6 +18,7 @@ DAYS_BACK         = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 QUALYS_PAGE_SIZE  = 1000
 RATE_LIMIT_DELAY  = 6
 AUDIT_LOG_FOLDER  = "audit_logs"
+OUTPUT_FOLDER     = "results"
 
 # === LOGGER SETUP ===
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -26,14 +27,15 @@ q_logger = logging.getLogger("QualysFilteredSearch")
 q_logger.propagate = False
 q_logger.setLevel(logging.WARNING)
 
-def sanitize_for_filename(s: str) -> str:
-    """Make a safe filename component"""
+def sanitize_filename(s: str) -> str:
     return re.sub(r"[^\w\-_.]", "_", s)
 
 def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
     logger.info("Starting integrated CVE→Qualys workflow (last %d days)...", days_back)
 
     ensure_audit_folder_exists()
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
     applications = load_applications()
 
     qs = QualysSearcher(
@@ -57,12 +59,12 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
 
         # 2) Save audit log
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = sanitize_for_filename(product.lower())
+        safe_name = sanitize_filename(product.lower())
         log_path = os.path.join(AUDIT_LOG_FOLDER, f"{safe_name}_cve_{ts}.json")
         save_audit_log(combined, custom_path=log_path)
         logger.info("  Audit log saved → %s", log_path)
 
-        # 3) Extract CVE data
+        # 3) Extract CVE info
         cve_ids       = [c["cve_id"]  for c in combined]
         cve_summaries = [c["summary"] for c in combined]
         versions = sorted({
@@ -73,26 +75,28 @@ def integrate_cve_to_qualys(days_back: int = DAYS_BACK):
 
         if not versions:
             logger.info("  No valid versions for %s; skipping Qualys.", product)
-        else:
+            continue
+
+        try:
             logger.info("  Running Qualys for versions: %s", versions)
-            try:
-                qs.run(product, versions)
+            qs.run(product, versions)
 
-                # Generate safe filename
-                safe_software_name = sanitize_for_filename(product.replace(" ", "_"))
-                safe_versions_str  = sanitize_for_filename("_".join(versions))
-                excel_name = f"{safe_software_name}_versions_{safe_versions_str}.xlsx"
+            # Safe Excel name (no versions!)
+            excel_name = os.path.join(
+                OUTPUT_FOLDER,
+                f"{sanitize_filename(product)}_{ts}.xlsx"
+            )
 
-                # Now send the email
-                qs.send_email(
-                    filename=excel_name,
-                    software_name=product,
-                    max_versions=versions,
-                    cve_ids=cve_ids,
-                    cve_summaries=cve_summaries
-                )
-            except Exception as e:
-                logger.error("  Qualys run or email error for %s: %s", product, e)
+            # Send email with proper summary
+            qs.send_email(
+                filename=excel_name,
+                software_name=product,
+                max_versions=versions,
+                cve_ids=cve_ids,
+                cve_summaries=cve_summaries
+            )
+        except Exception as e:
+            logger.error("  Error during Qualys run or email for %s: %s", product, e)
 
         if idx < len(applications):
             logger.info("Sleeping %d seconds to respect rate limits...", RATE_LIMIT_DELAY)
