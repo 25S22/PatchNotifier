@@ -9,13 +9,13 @@ import os
 import win32com.client as win32
 
 # === CONFIGURATION ===
-USERNAME      = "your_qualys_username"
-PASSWORD      = "your_qualys_password"
-CERT_PATH     = "/path/to/your/corporate_cert.pem"
-BASE_URL      = "https://qualysapi.qg1.apps.qualys.in"
-PAGE_SIZE     = 100
+USERNAME        = "your_qualys_username"
+PASSWORD        = "your_qualys_password"
+CERT_PATH       = "/path/to/your/corporate_cert.pem"
+BASE_URL        = "https://qualysapi.qg1.apps.qualys.in"
+PAGE_SIZE       = 100
 FILTER_OPERATOR = "CONTAINS"
-LOG_LEVEL     = logging.INFO
+LOG_LEVEL       = logging.INFO
 
 # === LOGGER SETUP ===
 logger = logging.getLogger("QualysFilteredSearch")
@@ -27,12 +27,12 @@ logger.setLevel(LOG_LEVEL)
 
 class QualysSearcher:
     def __init__(self, username, password, cert_path, page_size=100):
-        self.base_url = BASE_URL.rstrip("/")
-        self.session  = requests.Session()
-        self.auth     = HTTPBasicAuth(username, password)
-        self.cert_path = cert_path
-        self.page_size = page_size
-        self.fo_headers = {"X-Requested-With": "Python script"}
+        self.base_url    = BASE_URL.rstrip("/")
+        self.session     = requests.Session()
+        self.auth        = HTTPBasicAuth(username, password)
+        self.cert_path   = cert_path
+        self.page_size   = page_size
+        self.fo_headers  = {"X-Requested-With": "Python script"}
         self.qps_headers = {
             "Content-Type": "application/xml",
             "Accept": "application/xml"
@@ -76,19 +76,21 @@ class QualysSearcher:
         return ET.tostring(root, encoding="utf-8")
 
     def search_hosts(self, software_name):
-        url    = f"{self.base_url}/qps/rest/2.0/search/am/hostasset"
-        offset = 1
-        page   = 1
+        url     = f"{self.base_url}/qps/rest/2.0/search/am/hostasset"
+        offset  = 1
+        page    = 1
         results = []
 
         while True:
             logger.info(f"Fetching page {page}, offset {offset}...")
             body = self.build_request(software_name, offset)
-            resp = self.session.post(url,
-                                     headers=self.qps_headers,
-                                     auth=self.auth,
-                                     data=body,
-                                     verify=self.cert_path)
+            resp = self.session.post(
+                url,
+                headers=self.qps_headers,
+                auth=self.auth,
+                data=body,
+                verify=self.cert_path
+            )
             if resp.status_code == 403:
                 raise Exception("Forbidden. Check access/credentials.")
             resp.raise_for_status()
@@ -162,7 +164,7 @@ class QualysSearcher:
                 })
             return matches
 
-        # multi-version (major.minor) logic
+        # multi-version logic (major.minor)
         ranges = []
         for mv_str, pv in cleaned:
             rel = getattr(pv, "release", None)
@@ -210,9 +212,14 @@ class QualysSearcher:
             })
         return matches
 
-    def send_email(self, filename, software_name, max_versions, cve_ids=None, cve_summaries=None):
+    def send_email(
+        self, filename, software_name, max_versions,
+        cve_ids=None, cve_summaries=None,
+        total=0, below=0, upto=0, notfound=0
+    ):
         """
-        Send email notification via Outlook draft, optionally including CVE summaries.
+        Send email notification via Outlook draft, optionally including CVE summaries
+        and summary counts.
         """
         outlook = win32.Dispatch("Outlook.Application")
         mail    = outlook.CreateItem(0)
@@ -224,8 +231,13 @@ class QualysSearcher:
         # Body sections
         header = (
             f"Hello team,\n\n"
-            f"Please find attached the report of all devices where '{software_name}' is installed.\n"
+            f"Please find attached the patch status report for systems with '{software_name}' installed.\n"
             f"Target version(s): {joined_max}.\n\n"
+            f"Summary:\n"
+            f"  • Total Devices Evaluated: {total}\n"
+            f"  • Devices Below Target Version: {below}\n"
+            f"  • Devices Up-to-Date: {upto}\n"
+            f"  • Software Not Found: {notfound}\n\n"
         )
 
         summary_section = ""
@@ -246,7 +258,7 @@ class QualysSearcher:
 
         mail.Body = header + summary_section + footer
 
-        # Attachment
+        # Attach file
         attachment_path = os.path.abspath(filename)
         mail.Attachments.Add(attachment_path)
 
@@ -268,12 +280,14 @@ class QualysSearcher:
             filename = f"{software_name.replace(' ', '_')}_versions_{'_'.join(max_versions)}.xlsx"
             if not all_matches:
                 logger.info("No matching records found.")
+                # create empty DataFrame & save
                 df = pd.DataFrame(columns=[
                     "Host ID", "DNS", "NetBIOS",
                     "Software", "Version", "Status", "Range"
                 ])
                 df.to_excel(filename, index=False)
                 logger.info(f"Saved empty Excel: {filename}")
+                # send email with zero counts
                 self.send_email(filename, software_name, max_versions)
                 return
 
@@ -286,7 +300,21 @@ class QualysSearcher:
             df = df.sort_values(["Status", "Host ID"])
             df.to_excel(filename, index=False)
             logger.info(f"Saved Excel: {filename}")
-            self.send_email(filename, software_name, max_versions)
+
+            # compute summary counts
+            counts = df["Status"].value_counts().to_dict()
+            total   = len(df)
+            below   = counts.get("Below target", 0)
+            upto    = counts.get("Up-to-date",    0)
+            notfound= counts.get("Not Found",     0)
+
+            # send email with stats
+            self.send_email(
+                filename, software_name, max_versions,
+                cve_ids=None, cve_summaries=None,
+                total=total, below=below,
+                upto=upto, notfound=notfound
+            )
         finally:
             self.logout()
 
